@@ -1,3 +1,65 @@
+# sub2api-kiro-enhanced
+
+A maintained downstream derived from [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api) and [nianzs/sub2api's Kiro implementation](https://github.com/nianzs/sub2api). This project combines the official gateway with Kiro support and additional routing, compatibility, and cache-estimation hardening.
+
+## Remotes and lineage
+
+| Remote | Source | Role |
+| --- | --- | --- |
+| `upstream` | `https://github.com/Wei-Shaw/sub2api.git` | Official project; fetch and compare every sync cycle |
+| `kiro-upstream` | `https://github.com/nianzs/sub2api.git` | Primary source for periodic Kiro updates |
+| `origin` (when configured) | Your public `sub2api-kiro-enhanced` repository | Downstream publication destination |
+
+The initial public tree starts from official commit `ab99d56e9626e6cd731592dae8553c9758a0efa2` and imports the downstream file delta from snapshot `94d954374fee9e3fca624b690ab6fbec8eae82c9`, which incorporates Kiro upstream `5d4ea03887ea219ea77ab447d59efc0c02a816ef`. Only official Git ancestry is retained at import; the earlier downstream history is not imported. Snapshot IDs document provenance, not commits expected to exist in this repository. Public documentation replaces internal task artifacts. The Go module name remains `github.com/Wei-Shaw/sub2api` for compatibility.
+
+## What this downstream includes
+
+Compared with the pinned Kiro upstream revision above:
+
+- **Auth-surface routing and endpoint/profile failover:** auto mode tries CodeWhisperer first for IAM Identity Center and external IdP tokens, then Amazon Q and Kiro Runtime. Payload profiles are rebuilt for each surface and after refresh. Auth-surface mismatches can fall back without treating every 403 as an invalid account; model, quota, and policy errors retain their classification. API-key accounts remain on Amazon Q.
+- **Stable conversations and sticky accounts:** preserves the Kiro upstream implementation's deterministic conversation IDs and sticky account selection across turns; these are inherited features, not new additions over the pinned Kiro revision.
+- **Responses / Chat Completions / Anthropic compatibility:** preserves Kiro protocol adapters and adds Responses stream wire/namespace fixes and regression coverage. Buffered and streamed cache accounting is exercised across all three protocols; this is compatibility translation, not a promise of complete native API equivalence.
+- **Native-credit-driven cache estimation:** replaces fixed-ratio Kiro cache simulation with conservative reuse estimation from successful native Kiro metering observations. It uses translated prompt prefixes and isolates account/principal, endpoint, profile, model, and inference settings. Supported model IDs are `claude-opus-5` (5-minute reuse window) and `gpt-5.6-terra` (30 minutes, additionally scoped to the native conversation ID). These are estimator policies, not a guarantee of provider cache retention. Unsupported models and insufficient evidence do not receive estimated cache savings. Legacy ratio/mode fields remain accepted but are ignored by this estimator; the group enable switch still applies.
+- **Cache, failover, and trace hardening:** excludes malformed, truncated, failed, or unmetered observations from learning; isolates fallback attempts and web-search generations; avoids double-counting fully cached input. Kiro event tracing reports types and sizes instead of prompt/reasoning excerpts.
+- **Empty-response guard:** adds `response.failed` with `upstream_empty_response` when the Anthropic-to-Responses stream adapter completes without output items or output tokens. Also preserves the inherited OpenAI Responses guard that treats a completed stream with no semantic output or usage as a failover error before sending an empty success to the client.
+- **Build/release fixes:** preserves the Kiro upstream Docker dependency-install and legal-document context fixes, version-resolution scripts, and release workflow that avoids automatic version-file commits. These build/release changes are part of the delta against official upstream, but already present in the pinned Kiro upstream.
+
+See [Downstream changes](docs/DOWNSTREAM_CHANGES.md) for implementation and test references.
+
+## Periodic upstream sync
+
+Start only after the current downstream work is reviewed and committed and `git status --porcelain` is empty. Verify the remote URLs with `git remote -v`. Use a fresh integration branch, fetch both sources, and compare official changes even when Kiro is the primary update source:
+
+```sh
+git fetch upstream
+git fetch kiro-upstream
+git switch -c sync/kiro-YYYYMMDD
+kiro_before=5d4ea03887ea219ea77ab447d59efc0c02a816ef
+kiro_after=$(git rev-parse kiro-upstream/main)
+git log --oneline "$kiro_before..$kiro_after"
+git diff --stat "$kiro_before" "$kiro_after"
+git log --oneline HEAD..upstream/main
+git diff --stat upstream/main HEAD
+```
+
+Replace `kiro_before` with the last **successfully integrated** Kiro revision on subsequent cycles. To retain official-only ancestry, apply the incremental Kiro file delta instead of merging its history:
+
+```sh
+git merge-base --is-ancestor "$kiro_before" "$kiro_after"
+# Continue only if the ancestry check succeeds and the comparison is reviewed.
+kiro_patch=$(mktemp)
+git diff --binary --full-index "$kiro_before" "$kiro_after" > "$kiro_patch"
+git apply --3way "$kiro_patch"
+```
+
+Stop on errors or conflicts. Resolve each conflict against both upstream intent and the downstream behaviors listed above; never blanket-select one side. Review new files for internal task artifacts and private content. Run focused Go tests (`go test -tags=unit` for Kiro, compatibility, and gateway packages), frontend regression tests, and `pnpm build`; broaden checks when migrations, generated code, or shared routing change. Run `git diff --check`, inspect staged and unstaged changes, and obtain code review before committing the integration and recording the accepted revisions. No push or release is part of this workflow. Official updates not yet carried by Kiro require a separate reviewed integration from `upstream/main`.
+
+[Upstream sync guide](docs/UPSTREAM_SYNC.md) provides test commands, conflict handling, and the revision ledger. Upstream download scripts, image names, and release links below still target their original publishers; build this checkout to obtain downstream behavior.
+
+---
+
+## Upstream documentation
+
 <div align="center">
 
 <img src="assets/logo.svg" alt="Sub2API Logo" width="128" />
