@@ -206,6 +206,7 @@ export default {
     contentModeration: 'Content Moderation',
     promptAudit: 'Prompt Audit',
     auditLogs: 'Audit Logs',
+    promptRules: 'Prompt Rules',
   },
 
   // Auth

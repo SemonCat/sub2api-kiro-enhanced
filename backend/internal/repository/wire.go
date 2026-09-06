@@ -95,6 +95,7 @@ var ProviderSet = wire.NewSet(
 	NewUserAttributeValueRepository,
 	NewUserGroupRateRepository,
 	NewErrorPassthroughRepository,
+	NewPromptRuleRepository,
 	NewTLSFingerprintProfileRepository,
 	NewPluginRepository,
 	NewChannelRepository,
@@ -136,6 +137,7 @@ var ProviderSet = wire.NewSet(
 	NewTotpCache,
 	NewRefreshTokenCache,
 	NewErrorPassthroughCache,
+	NewPromptRuleCache,
 	NewTLSFingerprintProfileCache,
 	NewContentModerationHashCache,
 

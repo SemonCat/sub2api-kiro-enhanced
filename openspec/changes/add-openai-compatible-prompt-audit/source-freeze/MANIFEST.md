@@ -1,7 +1,7 @@
 # AICodex Prompt Audit source freeze manifest
 
 - Frozen at: `2026-07-16 20:21:19 CST (+0800)`
-- Source repository: `/Users/mt/code/mt-ai/aicodex/aicodex-api`
+- Source repository: `/path/to/aicodex-api`
 - Source branch at capture: `yjb`
 - Base commit: `7a50378851a80650cb0c086260b23abeb3469e6b`
 - Freeze method: immutable tracked patch plus untracked tar archive

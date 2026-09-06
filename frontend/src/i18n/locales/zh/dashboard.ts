@@ -469,6 +469,7 @@ export default {
       gemini: 'Gemini',
       grok: 'Grok',
       antigravity: 'Antigravity',
+      kiro: 'Kiro',
       kimi: 'Kimi',
       zhipu: '智谱 GLM',
       deepseek: 'DeepSeek'
@@ -482,6 +483,10 @@ export default {
     // 配额快照展示（MonitorQuotaView，管理端与用户端共用）
     quota: {
       unavailable: '配额信息不可用',
+      resetSoon: '即将重置',
+      accountsHealthy: '{healthy}/{total} 账号有额度',
+      accountsExhausted: '{count} 个已耗尽',
+      accountsUnknown: '{count} 个未知',
       windows: {
         '5h': '5 小时',
         '7d': '7 天',
@@ -497,7 +502,20 @@ export default {
         tokens: 'Token',
         shared: '共享',
         pro: 'Pro',
-        flash: 'Flash'
+        flash: 'Flash',
+        credits: '额度',
+        bonus: '赠额'
+      },
+      // 后端 message 是固定英文格式且已落库，展示层按格式解析后本地化（见 localizeMonitorMessage）
+      messages: {
+        noQuotaLeft: '额度已耗尽：{exhausted}/{total} 个账号无额度',
+        allUnavailable: '全部 {total} 个账号均无法获取额度',
+        quotaHigh: '额度紧张：{name} 已用 {percent}%',
+        balanceLow: '余额不足：{amount} {currency}',
+        balanceLowNoAmount: '余额不足（{currency}）',
+        accountNotFound: '关联账号不存在',
+        groupNotFound: '关联分组不存在',
+        groupNoAccounts: '关联分组内没有账号'
       }
     },
     extraModelsHeader: '附加模型',
@@ -852,6 +870,7 @@ export default {
       loadFailed: '加载 Passkey 失败。',
       added: 'Passkey 已添加。',
       addFailed: '添加 Passkey 失败。',
+      renameTitle: '重命名 Passkey',
       renamePrompt: '请输入新的 Passkey 名称',
       renamed: 'Passkey 已重命名。',
       renameFailed: '重命名 Passkey 失败。',

@@ -15,7 +15,7 @@ sub2api 当前已经存在一套完整的内容审核能力：
 
 ### 参考能力
 
-参考仓库 `/Users/mt/code/mt-ai/aicodex/aicodex-api` 当前磁盘实现提供：
+参考仓库 `/path/to/aicodex-api` 当前磁盘实现提供：
 
 - OpenAI 兼容 Qwen3Guard 审计池。
 - 持久 PromptAuditJob / PromptAuditEvent。

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 )
@@ -107,7 +108,11 @@ func (i *PluginPackageInstaller) Install(ctx context.Context, reader io.Reader, 
 	if err != nil {
 		return nil, fmt.Errorf("插件包不是有效的 ZIP: %w", err)
 	}
-	defer func() { _ = archive.Close() }()
+	// Windows 不允许重命名仍被打开的文件，closeArchive 需在 rename tempPath 前显式调用；
+	// 用 sync.Once 保证与 defer 中的兜底关闭幂等。
+	var archiveCloseOnce sync.Once
+	closeArchive := func() { archiveCloseOnce.Do(func() { _ = archive.Close() }) }
+	defer closeArchive()
 	manifest, _, signatureStatus, err := i.inspectArchive(&archive.Reader)
 	if err != nil {
 		return nil, err
@@ -141,6 +146,9 @@ func (i *PluginPackageInstaller) Install(ctx context.Context, reader io.Reader, 
 		return nil, fmt.Errorf("提交插件安装目录: %w", err)
 	}
 	extracted = true
+
+	// 解压已完成，archive 后续不再使用；先释放句柄再 rename，否则 Windows 上会 ERROR_SHARING_VIOLATION
+	closeArchive()
 
 	artifactPath := filepath.Join(packagesDir, manifest.ID+"-"+manifest.Version+"-"+artifactSHA[:12]+"-"+installNonce+".s2plugin")
 	if err := os.Rename(tempPath, artifactPath); err != nil {

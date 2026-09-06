@@ -221,7 +221,11 @@ export default {
          syncingModels: 'Syncing...',
          syncModelsSuccess: 'Synced {count} new model(s)',
          syncModelsAlreadyUpToDate: 'Models already up to date',
-         syncModelsError: 'Failed to sync models'
+         syncModelsError: 'Failed to sync models',
+         fillDefaultModels: 'Fill Default Models',
+         fillDefaultModelsAlreadyConfigured: 'Default models already configured',
+         fillDefaultModelsSuccess: 'Filled {count} default model(s)',
+         fillingDefaultModels: 'Filling...'
        }
      },
 
@@ -534,6 +538,7 @@ export default {
       nameRequired: 'Please enter a monitor name',
       primaryModelRequired: 'Please enter a primary model',
       linkedAccountRequired: 'Please select a linked account',
+      linkedGroupRequired: 'Please select a linked group',
       columns: {
         name: 'Name',
         provider: 'Provider',
@@ -559,6 +564,13 @@ export default {
         linkedAccountHint: 'Quota data comes from the selected account (reuses the account-side usage/balance queries)',
         linkedAccountEmpty: 'No accounts on this platform yet. Add one in Account Management first',
         linkedAccountMissing: 'The linked account no longer exists or is not accessible. Please re-select an account',
+        quotaSource: 'Quota data source',
+        quotaSourceAccount: 'Single account',
+        quotaSourceGroup: 'Group aggregate',
+        linkedGroupPlaceholder: 'Select a group',
+        linkedGroupHint: 'Aggregates quota across every active account in the group: still-healthy accounts report operational, all exhausted reports failed',
+        linkedGroupEmpty: 'No active groups on this platform yet. Create one in Group Management first',
+        linkedGroupMissing: 'The linked group no longer exists or is not accessible. Please re-select a group',
         openAIQuotaProbeHint: 'Note: on the OpenAI platform the usage query may trigger a Codex probe request that consumes the account\'s own quota (at most once every 10 minutes)',
         apiMode: 'OpenAI protocol',
         apiModeChatCompletions: 'OpenAI Compatible',
