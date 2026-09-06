@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,10 +80,11 @@ func (p *kiroCacheEmulationPlan) result() *kiroCacheEmulationUsage {
 	return p.usage
 }
 func kiroDynamicTTL(model string) time.Duration {
-	switch model {
-	case "claude-opus-5":
+	// Route by the native outbound model ID; keep the exact model in scope.
+	switch {
+	case strings.HasPrefix(model, "claude-"):
 		return 5 * time.Minute
-	case "gpt-5.6-terra":
+	case strings.HasPrefix(model, "gpt-"):
 		return 30 * time.Minute
 	default:
 		return 0
@@ -93,7 +95,7 @@ func kiroDynamicTTL(model string) time.Duration {
 // historical user messages use the same wrapper so advancing a turn preserves
 // the prefix ladder. Tools are a prelude, not sorted or rewritten. No inbound
 // metadata, raw byte prefixes, token credentials or generated conversation IDs
-// (except Terra's actual session scope) participate.
+// (except GPT's actual session scope) participate.
 func buildKiroOutboundCacheProfile(payload []byte, input int) (*kiroCacheProfile, kiropkg.KiroPayload, bool) {
 	var native kiropkg.KiroPayload
 	decoder := json.NewDecoder(bytes.NewReader(payload))
@@ -171,7 +173,7 @@ func prepareKiroDynamicCache(account *Account, group *Group, request kiropkg.Kir
 	}
 	model := native.ConversationState.CurrentMessage.UserInputMessage.ModelID
 	session := ""
-	if model == "gpt-5.6-terra" {
+	if strings.HasPrefix(model, "gpt-") {
 		session = native.ConversationState.ConversationID
 		if session == "" {
 			return nil

@@ -129,25 +129,60 @@ func TestKiroDynamicCalibrationAndFrozenUsage(t *testing.T) {
 	require.Zero(t, p.scope.active)
 }
 func TestKiroDynamicModelSessionAndSlidingTTL(t *testing.T) {
-	for _, model := range []string{"claude-opus-5", "gpt-5.6-terra"} {
+	for _, tc := range []struct {
+		model           string
+		ttl             time.Duration
+		sessionRequired bool
+	}{
+		{"claude-opus-5", 5 * time.Minute, false},
+		{"claude-opus-4.8", 5 * time.Minute, false},
+		{"claude-opus-4.6", 5 * time.Minute, false},
+		{"claude-opus-4-8-thinking", 5 * time.Minute, false},
+		{"claude-opus-4-6-20260101-thinking", 5 * time.Minute, false},
+		{"claude-opus-5-thinking", 5 * time.Minute, false},
+		{"claude-sonnet-4-6", 5 * time.Minute, false},
+		{"claude-haiku-4-5-20251001", 5 * time.Minute, false},
+		{"claude-future-99", 5 * time.Minute, false},
+		{"gpt-5.6-terra", 30 * time.Minute, true},
+		{"gpt-5.6-sol", 30 * time.Minute, true},
+		{"gpt-5.6-luna", 30 * time.Minute, true},
+		{"gpt-5", 30 * time.Minute, true},
+		{"gpt-future-99-20260906", 30 * time.Minute, true},
+	} {
+		model := tc.model
 		t.Run(model, func(t *testing.T) {
 			a, g, now := dynamicSetup(t)
 			r := dynamicRequest(t, model, "a")
 			dynamicTrain(t, a, g, r)
+			trained := dynamicPrepare(t, a, g, r)
+			require.NotNil(t, trained.result())
+			require.Equal(t, 8000, trained.result().CacheReadInputTokens)
+			require.Equal(t, 2000, trained.result().InputTokens)
+			require.Zero(t, trained.result().CacheCreationInputTokens)
+			require.Equal(t, tc.ttl, trained.ttl)
+			trained.complete(kiropkg.Usage{}, false)
+			missing := prepareKiroDynamicCache(a, g, dynamicRequest(t, model, ""), 10000)
+			if tc.sessionRequired {
+				require.Nil(t, missing)
+			} else {
+				require.NotNil(t, missing)
+				require.Equal(t, trained.key, missing.key)
+				require.NotNil(t, missing.result())
+				missing.complete(kiropkg.Usage{}, false)
+			}
 			other := mutateDynamicRequest(t, r, func(p *kiropkg.KiroPayload) { p.ConversationState.ConversationID = "b" })
 			p := dynamicPrepare(t, a, g, other)
-			if model == "claude-opus-5" {
+			if !tc.sessionRequired {
+				require.Equal(t, trained.key, p.key)
 				require.Equal(t, 10000, p.matched)
 				require.NotNil(t, p.result())
 			} else {
+				require.NotEqual(t, trained.key, p.key)
 				require.Zero(t, p.matched)
 				require.Nil(t, p.result())
 			}
 			p.complete(kiropkg.Usage{}, false)
-			ttl := 5 * time.Minute
-			if model == "gpt-5.6-terra" {
-				ttl = 30 * time.Minute
-			}
+			ttl := tc.ttl
 			require.Equal(t, ttl, kiroDynamicTTL(model))
 			*now = now.Add(ttl - time.Second)
 			p = dynamicPrepare(t, a, g, r)
@@ -209,8 +244,9 @@ func TestKiroDynamicScopeIsolationAndCredentialRotation(t *testing.T) {
 }
 func TestKiroDynamicUnknownDisabledAndFixedRatiosIgnored(t *testing.T) {
 	a, g, _ := dynamicSetup(t)
-	for _, model := range []string{"claude-sonnet-4-6", "gpt-5", "gpt-5.6-sol", "claude-opus-5-unknown"} {
-		require.Nil(t, prepareKiroDynamicCache(a, g, dynamicRequest(t, model, "a"), 10000))
+	for _, model := range []string{"", "unknown", "gemini-3", "claude", "gpt", "other-claude-opus-5", "other-gpt-5.6-sol", "provider/claude-opus-5", "provider/gpt-5.6-luna", "CLAUDE-opus-5", "GPT-5.6-sol", " claude-opus-5"} {
+		require.Zero(t, kiroDynamicTTL(model), model)
+		require.Nil(t, prepareKiroDynamicCache(a, g, dynamicRequest(t, model, "a"), 10000), model)
 	}
 	r := dynamicRequest(t, "claude-opus-5", "a")
 	dynamicTrain(t, a, g, r)
@@ -568,4 +604,24 @@ func TestKiroDynamicUsesActualOutboundAPIKeyHash(t *testing.T) {
 	p = dynamicPrepare(t, a, g, r)
 	require.Zero(t, p.matched)
 	p.complete(kiropkg.Usage{}, false)
+}
+
+func TestKiroDynamicFamilyCalibrationRemainsModelSpecific(t *testing.T) {
+	a, g, _ := dynamicSetup(t)
+	keys := make(map[[32]byte]string)
+	for _, model := range []string{"claude-opus-5", "claude-opus-4.8", "claude-opus-4.6", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"} {
+		r := dynamicRequest(t, model, "same-conversation")
+		cold := dynamicPrepare(t, a, g, r)
+		require.NotContains(t, keys, cold.key, model)
+		keys[cold.key] = model
+		require.Zero(t, cold.matched)
+		require.Empty(t, cold.scope.pairs)
+		require.Nil(t, cold.result())
+		cold.complete(kiropkg.Usage{}, false)
+		dynamicTrain(t, a, g, r)
+		warm := dynamicPrepare(t, a, g, r)
+		require.NotNil(t, warm.result())
+		require.Equal(t, 8000, warm.result().CacheReadInputTokens)
+		warm.complete(kiropkg.Usage{}, false)
+	}
 }
