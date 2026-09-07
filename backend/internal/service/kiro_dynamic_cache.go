@@ -26,11 +26,22 @@ const (
 type kiroDynamicSampleKey struct {
 	shape  [32]byte // inference configuration discriminator
 	prefix [32]byte
-	output int
 }
 type kiroDynamicSample struct {
-	cold    float64
-	expires time.Time
+	// coldDensity is native credits per native total token (InputTokens +
+	// OutputTokens), observed on a call whose matched prefix was zero (no
+	// reuse at all). Real agent traffic keeps output length unconstrained per
+	// turn (single digits to 1000+ tokens observed for the same warmed
+	// prefix), so raw credits are not comparable across cold/warm calls with
+	// different output lengths. Dividing by each call's own total token count
+	// cancels the output-length term to first order without asserting any
+	// input/output price split. This is the minimum density observed for the
+	// (shape, prefix) pair: since ratio = 1 - warm/cold is monotonically
+	// decreasing in cold, the smallest cold value yields the smallest
+	// (most conservative) ratio, so `min` -- not mean -- keeps the estimator
+	// from ever overclaiming savings.
+	coldDensity float64
+	expires     time.Time
 }
 type kiroDynamicPair struct {
 	ratio   float64
@@ -196,10 +207,25 @@ func prepareKiroDynamicCache(account *Account, group *Group, request kiropkg.Kir
 	}
 	scopeJSON, _ := canonicalJSON([]any{account.ID, principalHash, account.GetCredential("user_id"), account.GetCredential("principal_id"), native.ProfileArn, request.CacheEndpoint, model, session})
 	shapeJSON, _ := canonicalJSON(native.InferenceConfig)
-	return globalKiroDynamicTracker.prepare(account.ID, sha256.Sum256(scopeJSON), sha256.Sum256(shapeJSON), profile, kiroDynamicTTL(model))
+	return globalKiroDynamicTracker.prepare(account.ID, sha256.Sum256(scopeJSON), sha256.Sum256(shapeJSON), profile, kiroDynamicTTL(model), group.EffectiveKiroCacheReadEmulationRatio())
 }
 
-func (t *kiroDynamicTracker) prepare(account int64, key, shape [32]byte, profile *kiroCacheProfile, ttl time.Duration) *kiroCacheEmulationPlan {
+// scaleKiroCacheTokens applies the pre-estimator static ratio to a proven
+// matched-token count, with the exact bounds/rounding of the original static
+// cache-read estimator: a non-positive ratio or token count reports nothing,
+// a ratio >=1 passes the full matched count through unrounded, and anything
+// in between rounds to the nearest token.
+func scaleKiroCacheTokens(tokens int, ratio float64) int {
+	if tokens <= 0 || ratio <= 0 {
+		return 0
+	}
+	if ratio >= 1 {
+		return tokens
+	}
+	return int(math.Round(float64(tokens) * ratio))
+}
+
+func (t *kiroDynamicTracker) prepare(account int64, key, shape [32]byte, profile *kiroCacheProfile, ttl time.Duration, staticReadRatio float64) *kiroCacheEmulationPlan {
 	now := t.now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -228,17 +254,50 @@ func (t *kiroDynamicTracker) prepare(account int64, key, shape [32]byte, profile
 	scope.epoch++
 	plan := &kiroCacheEmulationPlan{tracker: t, key: key, scope: scope, profile: profile, shape: shape, ttl: ttl, started: now, matched: matched, epoch: scope.epoch, exclusive: scope.active == 0}
 	scope.active++
-	if len(scope.pairs) >= 2 && matched > 0 {
-		// Lower envelope of the last eight matched pairs. Downward evidence
-		// applies immediately; old outliers age out so calibration can recover.
-		ratio := .9
-		for _, pair := range scope.pairs {
-			ratio = math.Min(ratio, pair.ratio)
-		}
-		read := int(float64(matched) * ratio)
-		read = min(max(read, 0), profile.totalInputTokens)
-		if read > 0 {
-			plan.usage = &kiroCacheEmulationUsage{InputTokens: profile.totalInputTokens - read, CacheReadInputTokens: read}
+	// matched > 0 is the only gate below: canonical prefix matching has
+	// already proven a genuine repeated prefix against this scope's live
+	// (non-expired) warmth. matched == 0 covers every other "not yet
+	// trustworthy" case by construction -- an unparseable/ineligible request
+	// or a disabled group never reaches here (prepareKiroDynamicCache returns
+	// nil first), and an account/model/profile/endpoint/session scope change
+	// or an expired prefix TTL simply finds no live prefix to match, leaving
+	// matched at 0. A failed/aborted response never reaches this scope's
+	// prefixes either, since complete() only records them on success. None of
+	// those cases fall back to the static estimator below.
+	if matched > 0 {
+		if len(scope.pairs) >= 2 {
+			// Lower envelope of the last eight matched pairs. Downward evidence
+			// applies immediately; old outliers age out so calibration can recover.
+			// This is the authoritative dynamic estimate: once it exists it
+			// takes precedence over the static fallback below even when it
+			// evaluates to a legitimate zero (a real, calibrated "no reuse"
+			// verdict is not the same as "no dynamic ratio available").
+			ratio := .9
+			for _, pair := range scope.pairs {
+				ratio = math.Min(ratio, pair.ratio)
+			}
+			read := int(float64(matched) * ratio)
+			read = min(max(read, 0), profile.totalInputTokens)
+			if read > 0 {
+				plan.usage = &kiroCacheEmulationUsage{InputTokens: profile.totalInputTokens - read, CacheReadInputTokens: read}
+			}
+		} else {
+			// Static pre-estimator fallback: native-credit calibration has
+			// not yet produced two valid pairs for this scope, but canonical
+			// prefix matching has already proven a real repeated prefix.
+			// Reporting a deliberately less-precise static estimate here --
+			// using the group's existing EffectiveKiroCacheReadEmulationRatio
+			// and the pre-regression static estimator's own bounds/rounding
+			// (scaleKiroCacheTokens) -- is preferable to indefinitely
+			// reporting zero for genuinely warmed traffic. The moment dynamic
+			// calibration produces >=2 pairs, the branch above takes over
+			// unconditionally (including when it computes a valid ratio of
+			// 0) and this fallback no longer runs for this scope.
+			read := scaleKiroCacheTokens(matched, staticReadRatio)
+			read = min(max(read, 0), profile.totalInputTokens)
+			if read > 0 {
+				plan.usage = &kiroCacheEmulationUsage{InputTokens: profile.totalInputTokens - read, CacheReadInputTokens: read}
+			}
 		}
 	}
 	return plan
@@ -270,42 +329,58 @@ func (p *kiroCacheEmulationPlan) complete(usage kiropkg.Usage, success bool) {
 			return
 		}
 		if p.exclusive && p.epoch == s.epoch {
-			k := kiroDynamicSampleKey{shape: p.shape, output: usage.OutputTokens, prefix: p.profile.blocks[len(p.profile.blocks)-1].prefixFingerprint}
-			sample, exists := s.samples[k]
-			if exists && !sample.expires.After(now) {
-				delete(s.samples, k)
-				exists = false
+			// Real agent traffic is append-only with unconstrained output
+			// length per turn, so cold and warm calls essentially never share
+			// an output token count (see kiroDynamicSample.coldDensity for
+			// why raw credits are not comparable across them). Normalizing by
+			// each call's own native total token count removes that
+			// dependency, so pairing keys on (shape, prefix) only -- output
+			// no longer gates whether an observation can calibrate.
+			total := usage.TotalTokens
+			if total <= 0 {
+				total = usage.InputTokens + usage.OutputTokens
 			}
-			if p.matched == 0 {
-				if !exists || usage.KiroCredits < sample.cold {
-					sample = kiroDynamicSample{cold: usage.KiroCredits, expires: now.Add(kiroDynamicCalibrationTTL)}
+			if total > 0 {
+				density := usage.KiroCredits / float64(total)
+				k := kiroDynamicSampleKey{shape: p.shape, prefix: p.profile.blocks[len(p.profile.blocks)-1].prefixFingerprint}
+				sample, exists := s.samples[k]
+				if exists && !sample.expires.After(now) {
+					delete(s.samples, k)
+					exists = false
 				}
-				if exists || len(s.samples) < kiroDynamicMaxSamples {
-					s.samples[k] = sample
-				}
-			} else {
-				// Pair only a canonical cold terminal prefix that occurs on
-				// this request's warm ladder, with identical output count and
-				// inference configuration. Appended uncached input increases
-				// later credits, so ignoring its cost UNDERestimates savings;
-				// no input/output price slope is assumed or fitted.
-				breakpoints := p.profile.cacheableBreakpoints()
-				for i := len(breakpoints) - 1; i >= 0; i-- {
-					bp := breakpoints[i]
-					if p.profile.cacheTokensForBreakpoint(bp.cumulativeTokens) > p.matched {
-						continue
+				if p.matched == 0 {
+					if !exists || density < sample.coldDensity {
+						sample = kiroDynamicSample{coldDensity: density, expires: now.Add(kiroDynamicCalibrationTTL)}
 					}
-					k.prefix = p.profile.blocks[bp.blockIndex].prefixFingerprint
-					cold, found := s.samples[k]
-					if !found || !cold.expires.After(now) {
-						continue
+					if exists || len(s.samples) < kiroDynamicMaxSamples {
+						s.samples[k] = sample
 					}
-					ratio := math.Min(.9, math.Max(0, (cold.cold-usage.KiroCredits)/cold.cold))
-					s.pairs = append(s.pairs, kiroDynamicPair{ratio: ratio, expires: now.Add(kiroDynamicCalibrationTTL)})
-					if len(s.pairs) > 8 {
-						s.pairs = s.pairs[len(s.pairs)-8:]
+				} else {
+					// Pair only a canonical cold terminal prefix that occurs on
+					// this request's warm ladder and shares the inference
+					// configuration. Appended uncached input and this call's
+					// own output both inflate the observed density above the
+					// density a pure cache hit would show, so the derived
+					// ratio UNDERestimates savings; no input/output price
+					// slope is assumed or fitted.
+					breakpoints := p.profile.cacheableBreakpoints()
+					for i := len(breakpoints) - 1; i >= 0; i-- {
+						bp := breakpoints[i]
+						if p.profile.cacheTokensForBreakpoint(bp.cumulativeTokens) > p.matched {
+							continue
+						}
+						k.prefix = p.profile.blocks[bp.blockIndex].prefixFingerprint
+						cold, found := s.samples[k]
+						if !found || !cold.expires.After(now) || cold.coldDensity <= 0 {
+							continue
+						}
+						ratio := math.Min(.9, math.Max(0, (cold.coldDensity-density)/cold.coldDensity))
+						s.pairs = append(s.pairs, kiroDynamicPair{ratio: ratio, expires: now.Add(kiroDynamicCalibrationTTL)})
+						if len(s.pairs) > 8 {
+							s.pairs = s.pairs[len(s.pairs)-8:]
+						}
+						break
 					}
-					break
 				}
 			}
 		}

@@ -172,6 +172,18 @@ func TestKiroDynamicProtocolSchemasLocalIntegration(t *testing.T) {
 				a, g, _ := dynamicSetup(t)
 				a.Type = AccountTypeAPIKey
 				a.Credentials = map[string]any{"api_key": "ksk_test_local_only"}
+				// A ratio strictly between 0 and 1 (rather than dynamicSetup's
+				// default 1.0) so the static pre-calibration fallback (calls
+				// 2-3 below) produces a partial, legible estimate instead of a
+				// full pass-through. A full pass-through would report
+				// InputTokens==0 from the plan, which the pre-existing (and
+				// out of scope for this change) kiroUsageToClaude fallback
+				// substitutes back to the pre-cache estimate -- a real
+				// quirk when a cache estimate claims 100% reuse, but not
+				// something this test needs to exercise to validate the
+				// fallback feature itself.
+				g.KiroCacheEmulationMode = KiroCacheEmulationModeUniform
+				g.KiroCacheEmulationRatio = 0.5
 				cold := dynamicEvents(t, 10, 20)
 				warm := dynamicEvents(t, 2, 20)
 				var calls atomic.Int64
@@ -193,9 +205,26 @@ func TestKiroDynamicProtocolSchemasLocalIntegration(t *testing.T) {
 					require.Equal(t, http.StatusOK, rec.Code)
 					require.NotNil(t, result)
 					require.Zero(t, result.Usage.CacheCreationInputTokens)
-					if i < 3 {
+					switch {
+					case i == 0:
+						// Cold start: matched==0, no fallback possible.
 						require.Zero(t, result.Usage.CacheReadInputTokens)
-					} else {
+					case i < 3:
+						// matched>0 but fewer than two dynamic pairs exist yet
+						// (call 2 has 0 pairs, call 3 has 1): the static
+						// pre-calibration fallback governs using the group's
+						// 0.5 ratio, applied to the full matched prefix
+						// (this request never grows, so matched == the full
+						// profile every call). Calibration not being ready
+						// yet must never mean reporting zero for genuinely
+						// warmed traffic.
+						require.Greater(t, result.Usage.CacheReadInputTokens, 0)
+						total := result.Usage.InputTokens + result.Usage.CacheReadInputTokens
+						require.InDelta(t, .5, float64(result.Usage.CacheReadInputTokens)/float64(total), .0001)
+					default: // i == 3
+						// Two dynamic pairs now exist; dynamic calibration
+						// (ratio .8, from credits 10,2,2) takes over and
+						// governs regardless of the static 0.5 ratio.
 						require.Greater(t, result.Usage.CacheReadInputTokens, 0)
 						total := result.Usage.InputTokens + result.Usage.CacheReadInputTokens
 						require.InDelta(t, .8, float64(result.Usage.CacheReadInputTokens)/float64(total), .0001)

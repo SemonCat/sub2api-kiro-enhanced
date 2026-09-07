@@ -558,6 +558,14 @@ func ParseNonStreamingEventStreamWithContext(body io.Reader, model string, reque
 	// 整个预估提示词，否则会和 cache_read_input_tokens 重复计数。
 	if requestCtx.CacheEmulationUsage == nil && usage.InputTokens == 0 && requestCtx.EstimatedInputTokens > 0 {
 		usage.InputTokens = requestCtx.EstimatedInputTokens
+		// parseEventStream already set TotalTokens (from its own InputTokens,
+		// still 0 at that point, plus OutputTokens) before this fallback ran,
+		// so it is now stale -- understated by the entire estimated prompt
+		// size. Refresh it so any caller keying off TotalTokens (e.g.
+		// native-credit cache-reuse calibration, which normalizes by the
+		// true total token count) sees the corrected value instead of an
+		// inflated cold-call density.
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
 	return &ParseResult{
 		ResponseBody: buildClaudeResponse(content, toolUses, model, usage, stopReason, requestCtx),
