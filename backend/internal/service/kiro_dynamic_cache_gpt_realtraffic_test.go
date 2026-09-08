@@ -94,7 +94,7 @@ func TestKiroDynamicGPTRealTrafficCalibration(t *testing.T) {
 			expectedSavings := (pair.Cold - pair.WarmAvg) / pair.Cold
 			require.Greater(t, expectedSavings, 0.40, "sanity: fixture should sit in the ~45-53%% raw-savings range the pre-fix estimator was pinned to")
 			require.Less(t, expectedSavings, 0.53)
-			expectedReuse := kiroGPTInferredReuse(expectedSavings)
+			expectedReuse := kiroInferredReuse(expectedSavings, kiroGPTCachedMarginalCreditRatio)
 
 			// Third call: dynamic calibration (>=2 pairs) now governs,
 			// including the case of a legitimate zero -- it is simply not

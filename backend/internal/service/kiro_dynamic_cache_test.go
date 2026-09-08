@@ -145,15 +145,24 @@ func TestKiroDynamicCalibrationAndFrozenUsage(t *testing.T) {
 	r := dynamicRequest(t, "claude-opus-5", "a")
 	dynamicTrain(t, a, g, r)
 	p := dynamicPrepare(t, a, g, r)
-	require.Equal(t, 8000, p.result().CacheReadInputTokens)
-	require.Equal(t, 2000, p.result().InputTokens)
+	// dynamicTrain's .8 credit savings saturates to full reuse under Claude's
+	// calibrated d (.8/(1-.525) > 1), so the matched prefix reports in full.
+	require.Equal(t, 10000, p.result().CacheReadInputTokens)
+	require.Zero(t, p.result().InputTokens)
 	require.Zero(t, p.result().CacheCreationInputTokens)
 	frozen := *p.result()
 	p.complete(dynamicUsage(t, 8, 20), true)
 	require.Equal(t, frozen, *p.result())
 	p.complete(dynamicUsage(t, 1, 20), true) // idempotent late observer
 	next := dynamicPrepare(t, a, g, r)
-	require.InDelta(t, 2000, next.result().CacheReadInputTokens, 1)
+	// The late (non-idempotent-duplicate) observation above added a third,
+	// non-saturating pair (density 8/20=.4 vs cold .5 -> savings .2), pulling
+	// the lower envelope down to .2 -- below saturation, so the calibrated
+	// conversion now actually changes the reported count (not just clamps it).
+	require.Len(t, next.scope.pairs, 3)
+	require.InDelta(t, .2, next.scope.pairs[2].creditSavings, 1e-9)
+	wantRead := int(float64(next.matched) * kiroInferredReuse(.2, kiroClaudeCachedMarginalCreditRatio))
+	require.InDelta(t, wantRead, next.result().CacheReadInputTokens, 1)
 	next.complete(kiropkg.Usage{}, false)
 	// A bounded window can recover from low/negative observations.
 	p = dynamicPrepare(t, a, g, r)
@@ -166,7 +175,10 @@ func TestKiroDynamicCalibrationAndFrozenUsage(t *testing.T) {
 		p.complete(dynamicUsage(t, 2, 20), true)
 	}
 	p = dynamicPrepare(t, a, g, r)
-	require.Equal(t, 8000, p.result().CacheReadInputTokens)
+	// The outlier (0) and the .2 pair have both aged out of the fixed
+	// 8-pair window by now, leaving 8 identical .8 pairs -- saturating
+	// again, same as the very first assertion above.
+	require.Equal(t, 10000, p.result().CacheReadInputTokens)
 	p.complete(kiropkg.Usage{}, false)
 	require.Len(t, p.scope.pairs, 8)
 	require.Zero(t, p.scope.active)
@@ -199,18 +211,13 @@ func TestKiroDynamicModelSessionAndSlidingTTL(t *testing.T) {
 			dynamicTrain(t, a, g, r)
 			trained := dynamicPrepare(t, a, g, r)
 			require.NotNil(t, trained.result())
-			if tc.sessionRequired {
-				// GPT-family: dynamicTrain's synthetic credit savings (.8)
-				// converts to an inferred reuse of .8/(1-.523) ~= 1.68,
-				// clamped to 1 -- i.e. full structural reuse of the matched
-				// prefix, not the raw .8 savings figure Claude-family
-				// traffic would report for the same pairs.
-				require.Equal(t, 10000, trained.result().CacheReadInputTokens)
-				require.Zero(t, trained.result().InputTokens)
-			} else {
-				require.Equal(t, 8000, trained.result().CacheReadInputTokens)
-				require.Equal(t, 2000, trained.result().InputTokens)
-			}
+			// Both families are now calibrated (GPT d=.523, Claude d=.525),
+			// and dynamicTrain's synthetic .8 credit savings saturates to
+			// full inferred reuse under either constant (.8/(1-d) > 1 for
+			// both) -- i.e. full structural reuse of the matched prefix,
+			// not the raw .8 savings figure.
+			require.Equal(t, 10000, trained.result().CacheReadInputTokens)
+			require.Zero(t, trained.result().InputTokens)
 			require.Zero(t, trained.result().CacheCreationInputTokens)
 			require.Equal(t, tc.ttl, trained.ttl)
 			trained.complete(kiropkg.Usage{}, false)
@@ -307,7 +314,10 @@ func TestKiroDynamicUnknownDisabledAndFixedRatiosIgnored(t *testing.T) {
 	g.KiroCacheReadEmulationRatio = 0
 	g.KiroCacheCreationEmulationRatio = 0
 	p := dynamicPrepare(t, a, g, r)
-	require.Equal(t, 8000, p.result().CacheReadInputTokens)
+	// Zeroed static ratios are irrelevant here: >=2 dynamic pairs already
+	// exist, so the calibrated conversion governs (and .8 savings saturates
+	// to full reuse under Claude's d=.525), not the (zeroed) static fallback.
+	require.Equal(t, 10000, p.result().CacheReadInputTokens)
 	p.complete(kiropkg.Usage{}, false)
 	g.KiroCacheEmulationEnabled = false
 	require.Nil(t, prepareKiroDynamicCache(a, g, r, 10000))
@@ -460,18 +470,18 @@ func TestKiroDynamicCapacityAndCleanup(t *testing.T) {
 	keyFor := func(n int) [32]byte { var k [32]byte; binary.BigEndian.PutUint64(k[:8], uint64(n)); return k }
 	// Per-account quota rejects new namespaces without evicting any other account.
 	for i := 1; i <= kiroDynamicMaxAccountScopes; i++ {
-		p := tracker.prepare(a.ID, keyFor(i), keyFor(i), profile, 5*time.Minute, 0, false)
+		p := tracker.prepare(a.ID, keyFor(i), keyFor(i), profile, 5*time.Minute, 0, 0, false)
 		require.NotNil(t, p)
 		p.complete(kiropkg.Usage{}, false)
 	}
-	require.Nil(t, tracker.prepare(a.ID, keyFor(10000), keyFor(1), profile, 5*time.Minute, 0, false))
+	require.Nil(t, tracker.prepare(a.ID, keyFor(10000), keyFor(1), profile, 5*time.Minute, 0, 0, false))
 	for i := kiroDynamicMaxAccountScopes + 1; i <= kiroDynamicMaxScopes; i++ {
-		p := tracker.prepare(int64(i), keyFor(i), keyFor(i), profile, 5*time.Minute, 0, false)
+		p := tracker.prepare(int64(i), keyFor(i), keyFor(i), profile, 5*time.Minute, 0, 0, false)
 		require.NotNil(t, p)
 		p.complete(kiropkg.Usage{}, false)
 	}
 	require.Len(t, tracker.scopes, kiroDynamicMaxScopes)
-	require.Nil(t, tracker.prepare(99999, keyFor(10001), keyFor(1), profile, 5*time.Minute, 0, false))
+	require.Nil(t, tracker.prepare(99999, keyFor(10001), keyFor(1), profile, 5*time.Minute, 0, 0, false))
 	*now = now.Add(31 * time.Minute)
 	tracker.mu.Lock()
 	tracker.prune(*now)
@@ -485,7 +495,7 @@ func TestKiroDynamicCapacityAndCleanup(t *testing.T) {
 		for j := range copyProfile.blocks {
 			copyProfile.blocks[j].prefixFingerprint = keyFor(10000*i + j)
 		}
-		p := tracker.prepare(a.ID, keyFor(1), keyFor(i), &copyProfile, 5*time.Minute, 0, false)
+		p := tracker.prepare(a.ID, keyFor(1), keyFor(i), &copyProfile, 5*time.Minute, 0, 0, false)
 		require.NotNil(t, p)
 		p.complete(usage, true)
 	}
@@ -650,7 +660,9 @@ func TestKiroDynamicGrowingConversationCalibratesWithoutReplay(t *testing.T) {
 	fourth := grow(third, "fourth")
 	p = dynamicPrepare(t, a, g, fourth)
 	require.NotNil(t, p.result())
-	require.Equal(t, int(float64(p.matched)*.6), p.result().CacheReadInputTokens)
+	// .6 credit savings saturates to full inferred reuse under Claude's
+	// calibrated d=.525 (.6/(1-.525) > 1), not the raw .6 itself.
+	require.Equal(t, int(float64(p.matched)*kiroInferredReuse(.6, kiroClaudeCachedMarginalCreditRatio)), p.result().CacheReadInputTokens)
 	p.complete(kiropkg.Usage{}, false)
 	require.Len(t, p.scope.samples, 1, "learning used the original cold prefix without full replay")
 	for _, kind := range []string{"output", "config", "prefix"} {
@@ -725,77 +737,166 @@ func TestKiroDynamicFamilyCalibrationRemainsModelSpecific(t *testing.T) {
 		dynamicTrain(t, a, g, r)
 		warm := dynamicPrepare(t, a, g, r)
 		require.NotNil(t, warm.result())
-		if kiroModelIsGPTFamily(model) {
-			// GPT-family converts the .8 credit-savings pairs to a clamped
-			// full reuse (see TestKiroDynamicModelSessionAndSlidingTTL).
-			require.Equal(t, 10000, warm.result().CacheReadInputTokens, model)
-		} else {
-			require.Equal(t, 8000, warm.result().CacheReadInputTokens, model)
-		}
+		// Both families are calibrated (GPT d=0.523, Claude d=0.525), and
+		// dynamicTrain's .8 credit-savings pairs saturate the inferred reuse
+		// to 1 under either constant (.8/(1-d) > 1 for both), so every
+		// model here reports the full matched count -- the point of this
+		// test is that each model's warmth/pairs live in its own isolated
+		// scope (the `keys` uniqueness check above), not that the numeric
+		// outcome differs; TestKiroDynamicCreditSavingsConversionPerCalibratedFamily
+		// covers the two constants actually differing.
+		require.Equal(t, 10000, warm.result().CacheReadInputTokens, model)
+		require.Zero(t, warm.result().InputTokens, model)
 		warm.complete(kiropkg.Usage{}, false)
 	}
 }
 
-// TestKiroGPTInferredReuseConversionFormula is the focused unit test for the
-// pure conversion function: r = clamp(s/(1-d), 0, 1) with
-// d = kiroGPTCachedMarginalCreditRatio. It exercises the formula directly,
-// independent of the estimator's prepare/complete plumbing.
-func TestKiroGPTInferredReuseConversionFormula(t *testing.T) {
-	const d = kiroGPTCachedMarginalCreditRatio
-	for _, tc := range []struct {
-		name     string
-		savings  float64
-		expected float64
-	}{
-		{"zeroSavingsMeansZeroReuse", 0, 0},
-		{"boundarySavingsSaturatesToFullReuse", 1 - d, 1}, // s == 1-d is exactly r == 1
-		{"perPairCapAlsoSaturates", .9, 1},                // the pair-level .9 cap still saturates
-		{"midRangeSavingsScalesLinearly", 0.2, 0.2 / (1 - d)},
-		{"fullSavingsClampsToOne", 1, 1},
-		{"defensiveNegativeSavingsClampsToZero", -0.1, 0}, // creditSavings is never negative in practice, but the pure function must not report negative reuse
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			require.InDelta(t, tc.expected, kiroGPTInferredReuse(tc.savings), 1e-9)
+// TestKiroInferredReuseConversionFormula is the focused unit test for the
+// pure conversion function: r = clamp(s/(1-d), 0, 1). It exercises the
+// formula directly, independent of the estimator's prepare/complete
+// plumbing, against both calibrated families' constants.
+func TestKiroInferredReuseConversionFormula(t *testing.T) {
+	for _, d := range []float64{kiroGPTCachedMarginalCreditRatio, kiroClaudeCachedMarginalCreditRatio} {
+		t.Run(strconv.FormatFloat(d, 'f', -1, 64), func(t *testing.T) {
+			for _, tc := range []struct {
+				name     string
+				savings  float64
+				expected float64
+			}{
+				{"zeroSavingsMeansZeroReuse", 0, 0},
+				{"boundarySavingsSaturatesToFullReuse", 1 - d, 1}, // s == 1-d is exactly r == 1
+				{"perPairCapAlsoSaturates", .9, 1},                // the pair-level .9 cap still saturates
+				{"midRangeSavingsScalesLinearly", 0.2, 0.2 / (1 - d)},
+				{"fullSavingsClampsToOne", 1, 1},
+				{"defensiveNegativeSavingsClampsToZero", -0.1, 0}, // creditSavings is never negative in practice, but the pure function must not report negative reuse
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					require.InDelta(t, tc.expected, kiroInferredReuse(tc.savings, d), 1e-9)
+				})
+			}
+			require.Less(t, kiroInferredReuse(.1, d), kiroInferredReuse(.3, d), "higher observed savings must never produce lower inferred reuse")
 		})
 	}
-	require.Less(t, kiroGPTInferredReuse(.1), kiroGPTInferredReuse(.3), "higher observed savings must never produce lower inferred reuse")
 }
 
-// TestKiroDynamicCreditSavingsConversionAppliesOnlyToGPTFamily is the focused
-// test for family routing: given identical observed credit-savings pairs,
-// GPT-family traffic converts them through kiroGPTInferredReuse while
-// Claude-family traffic (uncalibrated for this factor) continues to use the
-// raw credit-savings fraction directly as the reuse fraction, exactly as
-// before this change.
-func TestKiroDynamicCreditSavingsConversionAppliesOnlyToGPTFamily(t *testing.T) {
+// TestKiroModelCreditCalibrationLookup is the focused test for the
+// family-specific calibration lookup: it must resolve exactly the two
+// currently-calibrated families to their own distinct constants, and report
+// no calibration for anything else (including near-miss model strings that
+// merely contain, rather than start with, a known family prefix).
+func TestKiroModelCreditCalibrationLookup(t *testing.T) {
+	for _, tc := range []struct {
+		model  string
+		wantD  float64
+		wantOK bool
+	}{
+		{"gpt-5.6-luna", kiroGPTCachedMarginalCreditRatio, true},
+		{"gpt-5", kiroGPTCachedMarginalCreditRatio, true},
+		{"gpt-future-99-20260906", kiroGPTCachedMarginalCreditRatio, true},
+		{"claude-opus-5", kiroClaudeCachedMarginalCreditRatio, true},
+		{"claude-sonnet-4-6", kiroClaudeCachedMarginalCreditRatio, true},
+		{"claude-haiku-4-5-20251001", kiroClaudeCachedMarginalCreditRatio, true},
+		{"", 0, false},
+		{"unknown", 0, false},
+		{"gemini-3", 0, false},
+		{"other-claude-opus-5", 0, false}, // contains, but does not start with, "claude-"
+		{"other-gpt-5.6-sol", 0, false},
+		{"CLAUDE-opus-5", 0, false}, // case-sensitive, matching kiroDynamicTTL
+	} {
+		name := tc.model
+		if name == "" {
+			name = "empty"
+		}
+		t.Run(name, func(t *testing.T) {
+			d, ok := kiroModelCreditCalibration(tc.model)
+			require.Equal(t, tc.wantOK, ok)
+			if tc.wantOK {
+				require.Equal(t, tc.wantD, d)
+			} else {
+				require.Zero(t, d)
+			}
+		})
+	}
+	require.NotEqual(t, kiroGPTCachedMarginalCreditRatio, kiroClaudeCachedMarginalCreditRatio,
+		"the two families must be independently calibrated, not aliases of the same constant")
+}
+
+// TestKiroDynamicCreditSavingsConversionPerCalibratedFamily is the focused
+// test for per-family routing: given the exact same observed credit-savings
+// pairs (a deliberately mid-range, non-saturating .3, so each family's
+// distinct d produces a measurably different inferred reuse), GPT-family and
+// Claude-family traffic each convert through their own calibrated constant.
+func TestKiroDynamicCreditSavingsConversionPerCalibratedFamily(t *testing.T) {
+	const coldCredits, warmCredits, output = 10.0, 7.0, 20 // density .5 vs .35 -> creditSavings .3
+	reuseByModel := map[string]float64{}
 	for _, tc := range []struct {
 		model string
-		gpt   bool
+		d     float64
 	}{
-		{"claude-opus-5", false},
-		{"gpt-5.6-luna", true},
+		{"gpt-5.6-luna", kiroGPTCachedMarginalCreditRatio},
+		{"claude-opus-5", kiroClaudeCachedMarginalCreditRatio},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
 			a, g, _ := dynamicSetup(t)
 			r := dynamicRequest(t, tc.model, "family-routing")
-			dynamicTrain(t, a, g, r) // cold density .5, two warm density .1 -> creditSavings .8 each
 			p := dynamicPrepare(t, a, g, r)
+			p.complete(dynamicUsage(t, coldCredits, output), true)
+			for i := 0; i < 2; i++ {
+				p = dynamicPrepare(t, a, g, r)
+				p.complete(dynamicUsage(t, warmCredits, output), true)
+			}
 			require.Len(t, p.scope.pairs, 2)
-			require.InDelta(t, .8, p.scope.pairs[0].creditSavings, 1e-9)
+			require.InDelta(t, .3, p.scope.pairs[0].creditSavings, 1e-9)
+			p = dynamicPrepare(t, a, g, r)
 			result := p.result()
 			require.NotNil(t, result)
-			require.Equal(t, tc.gpt, kiroModelIsGPTFamily(tc.model))
-			if tc.gpt {
-				require.Equal(t, p.matched, result.CacheReadInputTokens,
-					"GPT-family must convert .8 credit savings (s/(1-d)~=1.68) to a clamped full reuse, not report .8 itself")
-				require.Zero(t, result.InputTokens)
-			} else {
-				require.Equal(t, int(float64(p.matched)*.8), result.CacheReadInputTokens,
-					"Claude-family remains uncalibrated for this factor: raw credit savings is still used directly as reuse")
-			}
+			observedReuse := float64(result.CacheReadInputTokens) / float64(p.matched)
+			require.InDelta(t, kiroInferredReuse(.3, tc.d), observedReuse, 1e-3)
+			reuseByModel[tc.model] = observedReuse
 			p.complete(kiropkg.Usage{}, false)
 		})
 	}
+	// The two families' constants are distinct, so the identical .3 savings
+	// must produce different inferred reuse -- otherwise this test would not
+	// actually be distinguishing per-family calibration.
+	require.NotEqual(t, reuseByModel["gpt-5.6-luna"], reuseByModel["claude-opus-5"])
+}
+
+// TestKiroDynamicUncalibratedFamilyUsesRawSavingsDirectly exercises
+// kiroDynamicTracker.prepare's calibrated=false branch directly. No model
+// currently reachable through the public prepareKiroDynamicCache entry point
+// takes this path any more: both families eligible for dynamic caching at
+// all (kiroDynamicTTL's "claude-" and "gpt-") are now independently
+// calibrated, and anything else is excluded before prepare() is ever called
+// (see TestKiroDynamicUnknownDisabledAndFixedRatiosIgnored). This proves the
+// fallback for any future, not-yet-calibrated family still behaves exactly
+// as the pre-calibration estimator did: raw credit savings used directly as
+// reuse, unconverted.
+func TestKiroDynamicUncalibratedFamilyUsesRawSavingsDirectly(t *testing.T) {
+	_, g, _ := dynamicSetup(t)
+	tracker := globalKiroDynamicTracker
+	r := dynamicRequest(t, "claude-opus-5", "uncalibrated-lowlevel")
+	profile, _, ok := buildKiroOutboundCacheProfile(r.CachePayload, 10000)
+	require.True(t, ok)
+	var key, shape [32]byte
+	key[0] = 0xAB
+	staticRatio := g.EffectiveKiroCacheReadEmulationRatio()
+	step := func(credits float64) *kiroCacheEmulationPlan {
+		p := tracker.prepare(1, key, shape, profile, 5*time.Minute, staticRatio, 0, false)
+		require.NotNil(t, p)
+		p.complete(dynamicUsage(t, credits, 20), true)
+		return p
+	}
+	step(10) // cold, density .5
+	step(2)  // warm, density .1 -> creditSavings .8
+	step(2)  // warm, density .1 -> creditSavings .8
+	p := tracker.prepare(1, key, shape, profile, 5*time.Minute, staticRatio, 0, false)
+	require.Len(t, p.scope.pairs, 2)
+	result := p.result()
+	require.NotNil(t, result)
+	require.Equal(t, int(float64(p.matched)*.8), result.CacheReadInputTokens,
+		"calibrated=false must leave raw credit savings unconverted, exactly as the pre-calibration estimator did")
+	p.complete(kiropkg.Usage{}, false)
 }
 
 // kiroRealTrafficRequest seeds a session with content distinct from any other
@@ -955,21 +1056,24 @@ func TestKiroDynamicRealProductionTraffic(t *testing.T) {
 					require.Greater(t, result.CacheReadInputTokens, 0, "%s: call %d", name, i)
 					positive[name][i] = true
 					reportedSum[name] += float64(result.CacheReadInputTokens)
-					trueEquivSum[name] += float64(matched) * trueRatio[name][i]
+					trueEquivSum[name] += float64(matched) * kiroInferredReuse(trueRatio[name][i], kiroClaudeCachedMarginalCreditRatio)
 				default:
 					// Dynamic calibration (>=2 pairs) governs and takes
 					// precedence over the fallback. It may legitimately
 					// report nil (a genuinely calibrated "no reuse" verdict,
 					// as established by TestKiroDynamicCalibrationAndFrozenUsage)
 					// or a positive estimate bounded by the .9 lower-envelope
-					// cap.
+					// savings cap, converted through Claude's calibrated d
+					// (kiroInferredReuse(.9, d) saturates to 1 for Claude, so
+					// the bound in reuse terms is the full matched count).
 					if result := p.result(); result != nil {
 						require.LessOrEqual(t, result.CacheReadInputTokens, matched, "%s: call %d", name, i)
 						ratio := float64(result.CacheReadInputTokens) / float64(matched)
-						require.LessOrEqual(t, ratio, .9+1e-9, "%s: call %d exceeds the .9 dynamic lower-envelope cap", name, i)
+						maxReuse := kiroInferredReuse(.9, kiroClaudeCachedMarginalCreditRatio)
+						require.LessOrEqual(t, ratio, maxReuse+1e-9, "%s: call %d exceeds the dynamic lower-envelope cap", name, i)
 						positive[name][i] = true
 						reportedSum[name] += float64(result.CacheReadInputTokens)
-						trueEquivSum[name] += float64(matched) * trueRatio[name][i]
+						trueEquivSum[name] += float64(matched) * kiroInferredReuse(trueRatio[name][i], kiroClaudeCachedMarginalCreditRatio)
 					}
 				}
 				p.complete(dynamicUsageWithInput(t, row.Credits, row.Input, row.Output), true)
@@ -1003,8 +1107,14 @@ func TestKiroDynamicRealProductionTraffic(t *testing.T) {
 			// Conservative vs. the real observed native-credit reduction: the
 			// total cache-equivalent tokens this estimator ever claimed for
 			// the session must stay meaningfully below what the raw
-			// native-credit series actually implies (independently computed
-			// in kiroRealTrafficTrueRatio, never seen by the estimator).
+			// native-credit series actually implies once put through the
+			// same calibrated conversion the estimator itself uses (each
+			// call's own instantaneous savings -> reuse, independently
+			// computed in kiroRealTrafficTrueRatio and never seen by the
+			// estimator, which only ever sees a windowed lower envelope of
+			// savings across several calls -- always <= any single call's
+			// own savings, so it stays conservative in the converted space
+			// too).
 			require.Greater(t, reportedSum[name], 0.0, "%s: estimator should have reported nonzero cache reuse", name)
 			require.Less(t, reportedSum[name]/trueEquivSum[name], .95, "%s: aggregate estimate is not conservative relative to observed native-credit reduction", name)
 		}
@@ -1125,15 +1235,16 @@ func TestKiroDynamicVariableOutputOutlierResistance(t *testing.T) {
 	// Outlier: a warm call whose density (3.5/10=.35) is much closer to cold
 	// (.5) than the others -- e.g. a partial cache miss upstream -- drags the
 	// lower envelope down hard and immediately, with no smoothing.
-	outlierPlan := warm(3.5, 10) // ratio (.5-.35)/.5 = .3
+	outlierPlan := warm(3.5, 10) // savings (.5-.35)/.5 = .3
 	require.Len(t, outlierPlan.scope.pairs, 3)
-	outlierRatio := outlierPlan.scope.pairs[2].creditSavings
-	require.InDelta(t, .3, outlierRatio, 1e-9)
-	require.Less(t, outlierRatio, .5)
+	outlierSavings := outlierPlan.scope.pairs[2].creditSavings
+	require.InDelta(t, .3, outlierSavings, 1e-9)
+	require.Less(t, outlierSavings, .5)
+	outlierReuse := kiroInferredReuse(outlierSavings, kiroClaudeCachedMarginalCreditRatio)
 	next := dynamicPrepare(t, a, g, r)
 	require.NotNil(t, next.result())
-	require.InDelta(t, outlierRatio, float64(next.result().CacheReadInputTokens)/float64(next.matched), 1e-3,
-		"the lower envelope must apply the outlier immediately, never a smoothed/averaged ratio")
+	require.InDelta(t, outlierReuse, float64(next.result().CacheReadInputTokens)/float64(next.matched), 1e-3,
+		"the lower envelope must apply the outlier's converted reuse immediately, never a smoothed/averaged ratio")
 	next.complete(kiropkg.Usage{}, false)
 	// Eight more unremarkable warm calls (varying output throughout) are
 	// needed to push the outlier (the 3rd of what becomes 11 pairs ever
@@ -1143,11 +1254,11 @@ func TestKiroDynamicVariableOutputOutlierResistance(t *testing.T) {
 	}
 	require.Len(t, p.scope.pairs, 8)
 	for _, pair := range p.scope.pairs {
-		require.NotEqual(t, outlierRatio, pair.creditSavings, "outlier must have aged out of the fixed-size window")
+		require.NotEqual(t, outlierSavings, pair.creditSavings, "outlier must have aged out of the fixed-size window")
 	}
 	recovered := dynamicPrepare(t, a, g, r)
 	require.NotNil(t, recovered.result())
-	require.Greater(t, float64(recovered.result().CacheReadInputTokens)/float64(recovered.matched), outlierRatio,
+	require.Greater(t, float64(recovered.result().CacheReadInputTokens)/float64(recovered.matched), outlierReuse,
 		"once the outlier ages out, the estimate recovers toward the unremarkable trend")
 	recovered.complete(kiropkg.Usage{}, false)
 }
@@ -1225,13 +1336,14 @@ func TestKiroDynamicStaticFallbackTransitionsToDynamic(t *testing.T) {
 	}
 	require.Len(t, p.scope.pairs, 2)
 
-	// The instant two pairs exist, dynamic calibration (ratio .8, far above
-	// the static .3) takes over unconditionally.
+	// The instant two pairs exist, dynamic calibration (credit savings .8,
+	// which saturates to full inferred reuse under Claude's calibrated
+	// d=.525, far above the static .3) takes over unconditionally.
 	p = dynamicPrepare(t, a, g, r)
 	require.Len(t, p.scope.pairs, 2)
 	result := p.result()
 	require.NotNil(t, result)
-	require.Equal(t, 8000, result.CacheReadInputTokens, "dynamic estimate (ratio .8) must govern, not the static .3 fallback")
+	require.Equal(t, 10000, result.CacheReadInputTokens, "dynamic estimate (savings .8, saturating) must govern, not the static .3 fallback")
 	require.NotEqual(t, scaleKiroCacheTokens(p.matched, staticRatio), result.CacheReadInputTokens)
 	p.complete(kiropkg.Usage{}, false)
 }
