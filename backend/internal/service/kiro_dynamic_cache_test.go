@@ -199,8 +199,18 @@ func TestKiroDynamicModelSessionAndSlidingTTL(t *testing.T) {
 			dynamicTrain(t, a, g, r)
 			trained := dynamicPrepare(t, a, g, r)
 			require.NotNil(t, trained.result())
-			require.Equal(t, 8000, trained.result().CacheReadInputTokens)
-			require.Equal(t, 2000, trained.result().InputTokens)
+			if tc.sessionRequired {
+				// GPT-family: dynamicTrain's synthetic credit savings (.8)
+				// converts to an inferred reuse of .8/(1-.523) ~= 1.68,
+				// clamped to 1 -- i.e. full structural reuse of the matched
+				// prefix, not the raw .8 savings figure Claude-family
+				// traffic would report for the same pairs.
+				require.Equal(t, 10000, trained.result().CacheReadInputTokens)
+				require.Zero(t, trained.result().InputTokens)
+			} else {
+				require.Equal(t, 8000, trained.result().CacheReadInputTokens)
+				require.Equal(t, 2000, trained.result().InputTokens)
+			}
 			require.Zero(t, trained.result().CacheCreationInputTokens)
 			require.Equal(t, tc.ttl, trained.ttl)
 			trained.complete(kiropkg.Usage{}, false)
@@ -330,11 +340,11 @@ func TestKiroDynamicInvalidCreditsFailuresAndOutputVariation(t *testing.T) {
 	p = dynamicPrepare(t, a, g, r)
 	p.complete(dynamicUsage(t, 2, 21), true) // density 2/21 vs cold .5 -> ratio ~.81
 	require.Len(t, p.scope.pairs, 1)
-	require.InDelta(t, 0.8095238095238095, p.scope.pairs[0].ratio, 1e-9)
+	require.InDelta(t, 0.8095238095238095, p.scope.pairs[0].creditSavings, 1e-9)
 	p = dynamicPrepare(t, a, g, r)
 	p.complete(dynamicUsage(t, 2, 500), true) // density 2/500 vs cold .5 -> ratio capped at .9
 	require.Len(t, p.scope.pairs, 2)
-	require.InDelta(t, .9, p.scope.pairs[1].ratio, 1e-9)
+	require.InDelta(t, .9, p.scope.pairs[1].creditSavings, 1e-9)
 	// An explicit outputTokens:0 does not by itself starve the denominator:
 	// the native parser backfills output tokens from actual response text
 	// ("hello", from dynamicUsage) when the declared count is zero. The
@@ -344,7 +354,7 @@ func TestKiroDynamicInvalidCreditsFailuresAndOutputVariation(t *testing.T) {
 	p = dynamicPrepare(t, a, g, r)
 	p.complete(dynamicUsage(t, 2, 0), true)
 	require.Len(t, p.scope.pairs, 3)
-	require.InDelta(t, 0, p.scope.pairs[2].ratio, 1e-9)
+	require.InDelta(t, 0, p.scope.pairs[2].creditSavings, 1e-9)
 	// A genuinely empty response (no output text at all) plus a zero native
 	// input token count leaves no total-token denominator whatsoever; the
 	// observation is safely dropped instead of dividing by zero. Production
@@ -450,18 +460,18 @@ func TestKiroDynamicCapacityAndCleanup(t *testing.T) {
 	keyFor := func(n int) [32]byte { var k [32]byte; binary.BigEndian.PutUint64(k[:8], uint64(n)); return k }
 	// Per-account quota rejects new namespaces without evicting any other account.
 	for i := 1; i <= kiroDynamicMaxAccountScopes; i++ {
-		p := tracker.prepare(a.ID, keyFor(i), keyFor(i), profile, 5*time.Minute, 0)
+		p := tracker.prepare(a.ID, keyFor(i), keyFor(i), profile, 5*time.Minute, 0, false)
 		require.NotNil(t, p)
 		p.complete(kiropkg.Usage{}, false)
 	}
-	require.Nil(t, tracker.prepare(a.ID, keyFor(10000), keyFor(1), profile, 5*time.Minute, 0))
+	require.Nil(t, tracker.prepare(a.ID, keyFor(10000), keyFor(1), profile, 5*time.Minute, 0, false))
 	for i := kiroDynamicMaxAccountScopes + 1; i <= kiroDynamicMaxScopes; i++ {
-		p := tracker.prepare(int64(i), keyFor(i), keyFor(i), profile, 5*time.Minute, 0)
+		p := tracker.prepare(int64(i), keyFor(i), keyFor(i), profile, 5*time.Minute, 0, false)
 		require.NotNil(t, p)
 		p.complete(kiropkg.Usage{}, false)
 	}
 	require.Len(t, tracker.scopes, kiroDynamicMaxScopes)
-	require.Nil(t, tracker.prepare(99999, keyFor(10001), keyFor(1), profile, 5*time.Minute, 0))
+	require.Nil(t, tracker.prepare(99999, keyFor(10001), keyFor(1), profile, 5*time.Minute, 0, false))
 	*now = now.Add(31 * time.Minute)
 	tracker.mu.Lock()
 	tracker.prune(*now)
@@ -475,7 +485,7 @@ func TestKiroDynamicCapacityAndCleanup(t *testing.T) {
 		for j := range copyProfile.blocks {
 			copyProfile.blocks[j].prefixFingerprint = keyFor(10000*i + j)
 		}
-		p := tracker.prepare(a.ID, keyFor(1), keyFor(i), &copyProfile, 5*time.Minute, 0)
+		p := tracker.prepare(a.ID, keyFor(1), keyFor(i), &copyProfile, 5*time.Minute, 0, false)
 		require.NotNil(t, p)
 		p.complete(usage, true)
 	}
@@ -628,7 +638,7 @@ func TestKiroDynamicGrowingConversationCalibratesWithoutReplay(t *testing.T) {
 	require.Less(t, p.matched, 10000)
 	p.complete(dynamicUsage(t, 3, 20), true) // warm base cost2 plus appended uncached cost1
 	require.Len(t, p.scope.pairs, 1)
-	require.InDelta(t, .7, p.scope.pairs[0].ratio, 1e-9)
+	require.InDelta(t, .7, p.scope.pairs[0].creditSavings, 1e-9)
 	third := grow(second, "third")
 	p = dynamicPrepare(t, a, g, third)
 	// Still only one dynamic pair recorded -- the fallback fires again.
@@ -636,7 +646,7 @@ func TestKiroDynamicGrowingConversationCalibratesWithoutReplay(t *testing.T) {
 	require.Equal(t, p.matched, p.result().CacheReadInputTokens)
 	p.complete(dynamicUsage(t, 4, 20), true)
 	require.Len(t, p.scope.pairs, 2)
-	require.InDelta(t, .6, p.scope.pairs[1].ratio, 1e-9)
+	require.InDelta(t, .6, p.scope.pairs[1].creditSavings, 1e-9)
 	fourth := grow(third, "fourth")
 	p = dynamicPrepare(t, a, g, fourth)
 	require.NotNil(t, p.result())
@@ -671,7 +681,7 @@ func TestKiroDynamicGrowingConversationCalibratesWithoutReplay(t *testing.T) {
 				// this test, and the pre-fix code required an identical
 				// output count to ever record a pair.
 				require.Len(t, p.scope.pairs, 1)
-				require.InDelta(t, 0.7142857142857143, p.scope.pairs[0].ratio, 1e-9)
+				require.InDelta(t, 0.7142857142857143, p.scope.pairs[0].creditSavings, 1e-9)
 			} else {
 				// "config" changes the inference-config shape hash and
 				// "prefix" changes the fingerprint chain itself, so neither
@@ -715,8 +725,76 @@ func TestKiroDynamicFamilyCalibrationRemainsModelSpecific(t *testing.T) {
 		dynamicTrain(t, a, g, r)
 		warm := dynamicPrepare(t, a, g, r)
 		require.NotNil(t, warm.result())
-		require.Equal(t, 8000, warm.result().CacheReadInputTokens)
+		if kiroModelIsGPTFamily(model) {
+			// GPT-family converts the .8 credit-savings pairs to a clamped
+			// full reuse (see TestKiroDynamicModelSessionAndSlidingTTL).
+			require.Equal(t, 10000, warm.result().CacheReadInputTokens, model)
+		} else {
+			require.Equal(t, 8000, warm.result().CacheReadInputTokens, model)
+		}
 		warm.complete(kiropkg.Usage{}, false)
+	}
+}
+
+// TestKiroGPTInferredReuseConversionFormula is the focused unit test for the
+// pure conversion function: r = clamp(s/(1-d), 0, 1) with
+// d = kiroGPTCachedMarginalCreditRatio. It exercises the formula directly,
+// independent of the estimator's prepare/complete plumbing.
+func TestKiroGPTInferredReuseConversionFormula(t *testing.T) {
+	const d = kiroGPTCachedMarginalCreditRatio
+	for _, tc := range []struct {
+		name     string
+		savings  float64
+		expected float64
+	}{
+		{"zeroSavingsMeansZeroReuse", 0, 0},
+		{"boundarySavingsSaturatesToFullReuse", 1 - d, 1}, // s == 1-d is exactly r == 1
+		{"perPairCapAlsoSaturates", .9, 1},                // the pair-level .9 cap still saturates
+		{"midRangeSavingsScalesLinearly", 0.2, 0.2 / (1 - d)},
+		{"fullSavingsClampsToOne", 1, 1},
+		{"defensiveNegativeSavingsClampsToZero", -0.1, 0}, // creditSavings is never negative in practice, but the pure function must not report negative reuse
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.InDelta(t, tc.expected, kiroGPTInferredReuse(tc.savings), 1e-9)
+		})
+	}
+	require.Less(t, kiroGPTInferredReuse(.1), kiroGPTInferredReuse(.3), "higher observed savings must never produce lower inferred reuse")
+}
+
+// TestKiroDynamicCreditSavingsConversionAppliesOnlyToGPTFamily is the focused
+// test for family routing: given identical observed credit-savings pairs,
+// GPT-family traffic converts them through kiroGPTInferredReuse while
+// Claude-family traffic (uncalibrated for this factor) continues to use the
+// raw credit-savings fraction directly as the reuse fraction, exactly as
+// before this change.
+func TestKiroDynamicCreditSavingsConversionAppliesOnlyToGPTFamily(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		gpt   bool
+	}{
+		{"claude-opus-5", false},
+		{"gpt-5.6-luna", true},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			a, g, _ := dynamicSetup(t)
+			r := dynamicRequest(t, tc.model, "family-routing")
+			dynamicTrain(t, a, g, r) // cold density .5, two warm density .1 -> creditSavings .8 each
+			p := dynamicPrepare(t, a, g, r)
+			require.Len(t, p.scope.pairs, 2)
+			require.InDelta(t, .8, p.scope.pairs[0].creditSavings, 1e-9)
+			result := p.result()
+			require.NotNil(t, result)
+			require.Equal(t, tc.gpt, kiroModelIsGPTFamily(tc.model))
+			if tc.gpt {
+				require.Equal(t, p.matched, result.CacheReadInputTokens,
+					"GPT-family must convert .8 credit savings (s/(1-d)~=1.68) to a clamped full reuse, not report .8 itself")
+				require.Zero(t, result.InputTokens)
+			} else {
+				require.Equal(t, int(float64(p.matched)*.8), result.CacheReadInputTokens,
+					"Claude-family remains uncalibrated for this factor: raw credit savings is still used directly as reuse")
+			}
+			p.complete(kiropkg.Usage{}, false)
+		})
 	}
 }
 
@@ -1043,13 +1121,13 @@ func TestKiroDynamicVariableOutputOutlierResistance(t *testing.T) {
 	// A normal, varying-output run of warm calls settles at the .9 cap.
 	warm(2, 250) // density 2/250=.008 -> ratio .984 capped to .9
 	warm(3, 900) // density 3/900=.00333 -> ratio .99333 capped to .9
-	require.InDelta(t, .9, p.scope.pairs[len(p.scope.pairs)-1].ratio, 1e-9)
+	require.InDelta(t, .9, p.scope.pairs[len(p.scope.pairs)-1].creditSavings, 1e-9)
 	// Outlier: a warm call whose density (3.5/10=.35) is much closer to cold
 	// (.5) than the others -- e.g. a partial cache miss upstream -- drags the
 	// lower envelope down hard and immediately, with no smoothing.
 	outlierPlan := warm(3.5, 10) // ratio (.5-.35)/.5 = .3
 	require.Len(t, outlierPlan.scope.pairs, 3)
-	outlierRatio := outlierPlan.scope.pairs[2].ratio
+	outlierRatio := outlierPlan.scope.pairs[2].creditSavings
 	require.InDelta(t, .3, outlierRatio, 1e-9)
 	require.Less(t, outlierRatio, .5)
 	next := dynamicPrepare(t, a, g, r)
@@ -1065,7 +1143,7 @@ func TestKiroDynamicVariableOutputOutlierResistance(t *testing.T) {
 	}
 	require.Len(t, p.scope.pairs, 8)
 	for _, pair := range p.scope.pairs {
-		require.NotEqual(t, outlierRatio, pair.ratio, "outlier must have aged out of the fixed-size window")
+		require.NotEqual(t, outlierRatio, pair.creditSavings, "outlier must have aged out of the fixed-size window")
 	}
 	recovered := dynamicPrepare(t, a, g, r)
 	require.NotNil(t, recovered.result())

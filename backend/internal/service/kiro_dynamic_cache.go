@@ -21,7 +21,54 @@ const (
 	kiroDynamicMaxPrefixes      = 256
 	kiroDynamicMaxSamples       = 64
 	kiroDynamicCalibrationTTL   = 30 * time.Minute
+
+	// kiroGPTCachedMarginalCreditRatio (d) is the fraction of the full
+	// marginal credit cost that a cache-hit ("warm") token still bills at,
+	// for GPT-family Kiro traffic specifically. Measured via an authorized
+	// side-by-side comparison of kiro-cli direct traffic against the
+	// official Codex CLI ("Luna") at matched native input scales of
+	// ~21k/40k/62k tokens: Kiro's own observed warm/cold marginal-credit
+	// ratio was 52.3%, while the official client's own reported cached-input
+	// rate for the same requests was ~95-98% (see
+	// kiroGPTRealTrafficPairs / TestKiroDynamicGPTRealTrafficCalibration).
+	// Kiro credits carry a fixed dollar unit price, but that conversion
+	// factor cancels in this cold/warm ratio, so it plays no further role
+	// here.
+	//
+	// A call's observed native-credit *savings* s (see
+	// kiroDynamicPair.creditSavings) therefore systematically understates
+	// the true structural token-reuse fraction r: only the reused portion
+	// bills at d instead of 1, so s = r*(1-d), giving r = s/(1-d). Treating
+	// s itself as r -- the pre-fix behavior -- pinned GPT reuse estimates to
+	// s's own ~45-53% range even when the underlying prefix was almost
+	// fully reused.
+	//
+	// This is GPT/Luna-scoped evidence only. Do not apply this factor to
+	// Claude-family traffic without independent empirical justification;
+	// Claude's dynamic estimate continues to use raw creditSavings as r
+	// (see kiroDynamicTracker.prepare).
+	kiroGPTCachedMarginalCreditRatio = 0.523
 )
+
+// kiroModelIsGPTFamily reports whether model routes through Kiro's GPT-family
+// native protocol. This is the single source of truth for GPT-family
+// classification used to decide whether kiroGPTCachedMarginalCreditRatio
+// applies; kiroDynamicTTL below encodes the same "gpt-" prefix for its own
+// (unrelated) purpose of choosing a scope TTL.
+func kiroModelIsGPTFamily(model string) bool {
+	return strings.HasPrefix(model, "gpt-")
+}
+
+// kiroGPTInferredReuse converts an observed native-credit savings fraction s
+// (kiroDynamicPair.creditSavings) into an inferred structural token-reuse
+// fraction r for GPT-family traffic, using kiroGPTCachedMarginalCreditRatio:
+// r = s/(1-d), clamped to [0,1] since a token is either structurally reused
+// or it is not. See the constant's doc comment for the calibration this
+// implements.
+func kiroGPTInferredReuse(creditSavings float64) float64 {
+	reuse := creditSavings / (1 - kiroGPTCachedMarginalCreditRatio)
+	return math.Min(1, math.Max(0, reuse))
+}
 
 type kiroDynamicSampleKey struct {
 	shape  [32]byte // inference configuration discriminator
@@ -44,8 +91,16 @@ type kiroDynamicSample struct {
 	expires     time.Time
 }
 type kiroDynamicPair struct {
-	ratio   float64
-	expires time.Time
+	// creditSavings is the observed native-credit savings fraction s =
+	// (coldDensity-warmDensity)/coldDensity for one (shape, prefix)
+	// cold/warm observation pair, floored at 0 and capped at .9 (see
+	// kiroDynamicTracker.complete). This is NOT the structural token-reuse
+	// fraction: for GPT-family traffic it must first pass through
+	// kiroGPTInferredReuse before it is applied to a matched token count.
+	// Claude-family traffic (uncalibrated for this factor) uses it directly
+	// as the reuse fraction, unchanged from the pre-calibration estimator.
+	creditSavings float64
+	expires       time.Time
 }
 
 type kiroDynamicScope struct {
@@ -207,7 +262,7 @@ func prepareKiroDynamicCache(account *Account, group *Group, request kiropkg.Kir
 	}
 	scopeJSON, _ := canonicalJSON([]any{account.ID, principalHash, account.GetCredential("user_id"), account.GetCredential("principal_id"), native.ProfileArn, request.CacheEndpoint, model, session})
 	shapeJSON, _ := canonicalJSON(native.InferenceConfig)
-	return globalKiroDynamicTracker.prepare(account.ID, sha256.Sum256(scopeJSON), sha256.Sum256(shapeJSON), profile, kiroDynamicTTL(model), group.EffectiveKiroCacheReadEmulationRatio())
+	return globalKiroDynamicTracker.prepare(account.ID, sha256.Sum256(scopeJSON), sha256.Sum256(shapeJSON), profile, kiroDynamicTTL(model), group.EffectiveKiroCacheReadEmulationRatio(), kiroModelIsGPTFamily(model))
 }
 
 // scaleKiroCacheTokens applies the pre-estimator static ratio to a proven
@@ -225,7 +280,7 @@ func scaleKiroCacheTokens(tokens int, ratio float64) int {
 	return int(math.Round(float64(tokens) * ratio))
 }
 
-func (t *kiroDynamicTracker) prepare(account int64, key, shape [32]byte, profile *kiroCacheProfile, ttl time.Duration, staticReadRatio float64) *kiroCacheEmulationPlan {
+func (t *kiroDynamicTracker) prepare(account int64, key, shape [32]byte, profile *kiroCacheProfile, ttl time.Duration, staticReadRatio float64, gptFamily bool) *kiroCacheEmulationPlan {
 	now := t.now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -266,17 +321,30 @@ func (t *kiroDynamicTracker) prepare(account int64, key, shape [32]byte, profile
 	// those cases fall back to the static estimator below.
 	if matched > 0 {
 		if len(scope.pairs) >= 2 {
-			// Lower envelope of the last eight matched pairs. Downward evidence
-			// applies immediately; old outliers age out so calibration can recover.
-			// This is the authoritative dynamic estimate: once it exists it
-			// takes precedence over the static fallback below even when it
-			// evaluates to a legitimate zero (a real, calibrated "no reuse"
-			// verdict is not the same as "no dynamic ratio available").
-			ratio := .9
+			// Lower envelope of the last eight matched pairs' credit savings.
+			// Downward evidence applies immediately; old outliers age out so
+			// calibration can recover. This is the authoritative dynamic
+			// estimate: once it exists it takes precedence over the static
+			// fallback below even when it evaluates to a legitimate zero (a
+			// real, calibrated "no reuse" verdict is not the same as "no
+			// dynamic ratio available").
+			savings := .9
 			for _, pair := range scope.pairs {
-				ratio = math.Min(ratio, pair.ratio)
+				savings = math.Min(savings, pair.creditSavings)
 			}
-			read := int(float64(matched) * ratio)
+			// creditSavings is the native-credit savings fraction s, not the
+			// structural token-reuse fraction r. For GPT-family traffic,
+			// s systematically understates r because cache-hit tokens still
+			// bill at kiroGPTCachedMarginalCreditRatio instead of 0 -- convert
+			// before applying it to the matched (canonical prefix) bound. This
+			// evidence is GPT/Luna-scoped only; Claude-family traffic keeps
+			// using s directly as r, unchanged from before this conversion
+			// existed.
+			reuse := savings
+			if gptFamily {
+				reuse = kiroGPTInferredReuse(savings)
+			}
+			read := int(float64(matched) * reuse)
 			read = min(max(read, 0), profile.totalInputTokens)
 			if read > 0 {
 				plan.usage = &kiroCacheEmulationUsage{InputTokens: profile.totalInputTokens - read, CacheReadInputTokens: read}
@@ -374,8 +442,8 @@ func (p *kiroCacheEmulationPlan) complete(usage kiropkg.Usage, success bool) {
 						if !found || !cold.expires.After(now) || cold.coldDensity <= 0 {
 							continue
 						}
-						ratio := math.Min(.9, math.Max(0, (cold.coldDensity-density)/cold.coldDensity))
-						s.pairs = append(s.pairs, kiroDynamicPair{ratio: ratio, expires: now.Add(kiroDynamicCalibrationTTL)})
+						savings := math.Min(.9, math.Max(0, (cold.coldDensity-density)/cold.coldDensity))
+						s.pairs = append(s.pairs, kiroDynamicPair{creditSavings: savings, expires: now.Add(kiroDynamicCalibrationTTL)})
 						if len(s.pairs) > 8 {
 							s.pairs = s.pairs[len(s.pairs)-8:]
 						}
