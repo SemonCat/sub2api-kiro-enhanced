@@ -123,6 +123,10 @@ func dynamicPrepare(t *testing.T, a *Account, g *Group, r kiropkg.KiroRequestCon
 	return p
 }
 
+func dynamicPairs(p *kiroCacheEmulationPlan) []kiroDynamicPair {
+	return p.scope.calibrationPairs(p.profile, p.shape, p.profile.totalInputTokens)
+}
+
 // dynamicTrain bootstraps a scope to >=2 dynamic pairs (the first call
 // establishes the cold sample with matched==0; the second and third each
 // have matched>0 against the freshly-warmed prefix and contribute one pair
@@ -155,18 +159,19 @@ func TestKiroDynamicCalibrationAndFrozenUsage(t *testing.T) {
 	require.Equal(t, frozen, *p.result())
 	p.complete(dynamicUsage(t, 1, 20), true) // idempotent late observer
 	next := dynamicPrepare(t, a, g, r)
-	// The late (non-idempotent-duplicate) observation above added a third,
-	// non-saturating pair (density 8/20=.4 vs cold .5 -> savings .2), pulling
-	// the lower envelope down to .2 -- below saturation, so the calibrated
-	// conversion now actually changes the reported count (not just clamps it).
-	require.Len(t, next.scope.pairs, 3)
-	require.InDelta(t, .2, next.scope.pairs[2].creditSavings, 1e-9)
-	wantRead := int(float64(next.matched) * kiroInferredReuse(.2, kiroClaudeCachedMarginalCreditRatio))
-	require.InDelta(t, wantRead, next.result().CacheReadInputTokens, 1)
+	// A single low observation is retained without governing later requests.
+	require.Len(t, dynamicPairs(next), 3)
+	require.InDelta(t, .2, dynamicPairs(next)[2].creditSavings, 1e-9)
+	require.Equal(t, 10000, next.result().CacheReadInputTokens)
 	next.complete(kiropkg.Usage{}, false)
-	// A bounded window can recover from low/negative observations.
+	// A second low observation corroborates a decline to .2 savings.
 	p = dynamicPrepare(t, a, g, r)
 	p.complete(dynamicUsage(t, 20, 20), true)
+	p = dynamicPrepare(t, a, g, r)
+	wantRead := int(float64(p.matched) * kiroInferredReuse(.2, kiroClaudeCachedMarginalCreditRatio))
+	require.InDelta(t, wantRead, p.result().CacheReadInputTokens, 1)
+	p.complete(dynamicUsage(t, 20, 20), true)
+	// Two zero-savings observations still override a positive static fallback.
 	p = dynamicPrepare(t, a, g, r)
 	require.Nil(t, p.result())
 	p.complete(kiropkg.Usage{}, false)
@@ -180,7 +185,7 @@ func TestKiroDynamicCalibrationAndFrozenUsage(t *testing.T) {
 	// again, same as the very first assertion above.
 	require.Equal(t, 10000, p.result().CacheReadInputTokens)
 	p.complete(kiropkg.Usage{}, false)
-	require.Len(t, p.scope.pairs, 8)
+	require.Len(t, dynamicPairs(p), 8)
 	require.Zero(t, p.scope.active)
 }
 func TestKiroDynamicModelSessionAndSlidingTTL(t *testing.T) {
@@ -349,12 +354,12 @@ func TestKiroDynamicInvalidCreditsFailuresAndOutputVariation(t *testing.T) {
 	// total token) removes that dependency.
 	p = dynamicPrepare(t, a, g, r)
 	p.complete(dynamicUsage(t, 2, 21), true) // density 2/21 vs cold .5 -> ratio ~.81
-	require.Len(t, p.scope.pairs, 1)
-	require.InDelta(t, 0.8095238095238095, p.scope.pairs[0].creditSavings, 1e-9)
+	require.Len(t, dynamicPairs(p), 1)
+	require.InDelta(t, 0.8095238095238095, dynamicPairs(p)[0].creditSavings, 1e-9)
 	p = dynamicPrepare(t, a, g, r)
 	p.complete(dynamicUsage(t, 2, 500), true) // density 2/500 vs cold .5 -> ratio capped at .9
-	require.Len(t, p.scope.pairs, 2)
-	require.InDelta(t, .9, p.scope.pairs[1].creditSavings, 1e-9)
+	require.Len(t, dynamicPairs(p), 2)
+	require.InDelta(t, .9, dynamicPairs(p)[1].creditSavings, 1e-9)
 	// An explicit outputTokens:0 does not by itself starve the denominator:
 	// the native parser backfills output tokens from actual response text
 	// ("hello", from dynamicUsage) when the declared count is zero. The
@@ -363,8 +368,8 @@ func TestKiroDynamicInvalidCreditsFailuresAndOutputVariation(t *testing.T) {
 	// estimator never claims a warm call is more expensive than cold.
 	p = dynamicPrepare(t, a, g, r)
 	p.complete(dynamicUsage(t, 2, 0), true)
-	require.Len(t, p.scope.pairs, 3)
-	require.InDelta(t, 0, p.scope.pairs[2].creditSavings, 1e-9)
+	require.Len(t, dynamicPairs(p), 3)
+	require.InDelta(t, 0, dynamicPairs(p)[2].creditSavings, 1e-9)
 	// A genuinely empty response (no output text at all) plus a zero native
 	// input token count leaves no total-token denominator whatsoever; the
 	// observation is safely dropped instead of dividing by zero. Production
@@ -372,7 +377,7 @@ func TestKiroDynamicInvalidCreditsFailuresAndOutputVariation(t *testing.T) {
 	// only guards a defensive edge case that the parser itself can't rule out.
 	p = dynamicPrepare(t, a, g, r)
 	p.complete(dynamicUsageEmptyOutput(t, 2), true)
-	require.Len(t, p.scope.pairs, 3)
+	require.Len(t, dynamicPairs(p), 3)
 	p = dynamicPrepare(t, a, g, r)
 	*now = now.Add(5 * time.Minute)
 	p.complete(valid, true) // slow response must not resurrect expired cache
@@ -406,7 +411,7 @@ func TestKiroDynamicConcurrentPreparationAndCompletion(t *testing.T) {
 	wg.Wait()
 	require.Zero(t, plans[0].scope.active)
 	require.Empty(t, plans[0].scope.samples)
-	require.Empty(t, plans[0].scope.pairs)
+	require.Empty(t, dynamicPairs(plans[0]))
 }
 func TestKiroDynamicOutboundSemanticPrefixAndToolOrder(t *testing.T) {
 	a, g, _ := dynamicSetup(t)
@@ -520,7 +525,7 @@ func TestKiroDynamicCapacityAndCleanup(t *testing.T) {
 	*now = now.Add(31 * time.Minute)
 	p = dynamicPrepare(t, a, g, r)
 	require.Nil(t, p.result())
-	require.Empty(t, p.scope.pairs)
+	require.Empty(t, dynamicPairs(p))
 	p.complete(kiropkg.Usage{}, false)
 }
 
@@ -647,16 +652,16 @@ func TestKiroDynamicGrowingConversationCalibratesWithoutReplay(t *testing.T) {
 	require.Greater(t, p.matched, 0)
 	require.Less(t, p.matched, 10000)
 	p.complete(dynamicUsage(t, 3, 20), true) // warm base cost2 plus appended uncached cost1
-	require.Len(t, p.scope.pairs, 1)
-	require.InDelta(t, .7, p.scope.pairs[0].creditSavings, 1e-9)
+	require.Len(t, dynamicPairs(p), 1)
+	require.InDelta(t, .7, dynamicPairs(p)[0].creditSavings, 1e-9)
 	third := grow(second, "third")
 	p = dynamicPrepare(t, a, g, third)
 	// Still only one dynamic pair recorded -- the fallback fires again.
 	require.NotNil(t, p.result())
 	require.Equal(t, p.matched, p.result().CacheReadInputTokens)
 	p.complete(dynamicUsage(t, 4, 20), true)
-	require.Len(t, p.scope.pairs, 2)
-	require.InDelta(t, .6, p.scope.pairs[1].creditSavings, 1e-9)
+	require.Len(t, dynamicPairs(p), 2)
+	require.InDelta(t, .6, dynamicPairs(p)[1].creditSavings, 1e-9)
 	fourth := grow(third, "fourth")
 	p = dynamicPrepare(t, a, g, fourth)
 	require.NotNil(t, p.result())
@@ -692,13 +697,13 @@ func TestKiroDynamicGrowingConversationCalibratesWithoutReplay(t *testing.T) {
 				// output per turn far more than the fixed 20 used elsewhere in
 				// this test, and the pre-fix code required an identical
 				// output count to ever record a pair.
-				require.Len(t, p.scope.pairs, 1)
-				require.InDelta(t, 0.7142857142857143, p.scope.pairs[0].creditSavings, 1e-9)
+				require.Len(t, dynamicPairs(p), 1)
+				require.InDelta(t, 0.7142857142857143, dynamicPairs(p)[0].creditSavings, 1e-9)
 			} else {
 				// "config" changes the inference-config shape hash and
 				// "prefix" changes the fingerprint chain itself, so neither
 				// finds the recorded cold sample regardless of output length.
-				require.Empty(t, p.scope.pairs)
+				require.Empty(t, dynamicPairs(p))
 			}
 		})
 	}
@@ -731,7 +736,7 @@ func TestKiroDynamicFamilyCalibrationRemainsModelSpecific(t *testing.T) {
 		require.NotContains(t, keys, cold.key, model)
 		keys[cold.key] = model
 		require.Zero(t, cold.matched)
-		require.Empty(t, cold.scope.pairs)
+		require.Empty(t, dynamicPairs(cold))
 		require.Nil(t, cold.result())
 		cold.complete(kiropkg.Usage{}, false)
 		dynamicTrain(t, a, g, r)
@@ -785,6 +790,8 @@ func TestKiroInferredReuseConversionFormula(t *testing.T) {
 // no calibration for anything else (including near-miss model strings that
 // merely contain, rather than start with, a known family prefix).
 func TestKiroModelCreditCalibrationLookup(t *testing.T) {
+	require.Equal(t, 0.523, kiroGPTCachedMarginalCreditRatio)
+	require.Equal(t, 0.525, kiroClaudeCachedMarginalCreditRatio)
 	for _, tc := range []struct {
 		model  string
 		wantD  float64
@@ -845,8 +852,8 @@ func TestKiroDynamicCreditSavingsConversionPerCalibratedFamily(t *testing.T) {
 				p = dynamicPrepare(t, a, g, r)
 				p.complete(dynamicUsage(t, warmCredits, output), true)
 			}
-			require.Len(t, p.scope.pairs, 2)
-			require.InDelta(t, .3, p.scope.pairs[0].creditSavings, 1e-9)
+			require.Len(t, dynamicPairs(p), 2)
+			require.InDelta(t, .3, dynamicPairs(p)[0].creditSavings, 1e-9)
 			p = dynamicPrepare(t, a, g, r)
 			result := p.result()
 			require.NotNil(t, result)
@@ -891,7 +898,7 @@ func TestKiroDynamicUncalibratedFamilyUsesRawSavingsDirectly(t *testing.T) {
 	step(2)  // warm, density .1 -> creditSavings .8
 	step(2)  // warm, density .1 -> creditSavings .8
 	p := tracker.prepare(1, key, shape, profile, 5*time.Minute, staticRatio, 0, false)
-	require.Len(t, p.scope.pairs, 2)
+	require.Len(t, dynamicPairs(p), 2)
 	result := p.result()
 	require.NotNil(t, result)
 	require.Equal(t, int(float64(p.matched)*.8), result.CacheReadInputTokens,
@@ -947,9 +954,9 @@ func kiroRealTrafficGrow(t *testing.T, req kiropkg.KiroRequestContext, label str
 // Per prepareKiroDynamicCache, Claude-family scope keys do not include the
 // conversation ID (only GPT does, see TestKiroDynamicModelSessionAndSlidingTTL
 // and TestKiroDynamicFamilyCalibrationRemainsModelSpecific) -- so these two
-// concurrent conversations intentionally share one calibration pool (pairs),
-// exactly as the real production account would, while remaining fully
-// isolated at the content level: each session's own distinct message history
+// concurrent conversations share prefix warmth but own separate calibration
+// histories for their distinct cold baselines. They remain isolated at the
+// content level: each session's own distinct message history
 // produces its own prefix-fingerprint chain, so one session's blocks can
 // never register as "matched" against the other's (asserted below via each
 // session's own first call staying a fresh matched==0 cold start even though
@@ -970,7 +977,7 @@ func TestKiroDynamicRealProductionTraffic(t *testing.T) {
 	require.Len(t, kiroRealTrafficSessionA, 60)
 	require.Len(t, kiroRealTrafficSessionB, 61)
 
-	t.Run("concurrentSharedAccountConservativeAndSustained", func(t *testing.T) {
+	t.Run("concurrentSharedAccountIndependentAndSustained", func(t *testing.T) {
 		a, g, _ := dynamicSetup(t)
 		// A deliberately conservative, non-1.0 static ratio: distinct from
 		// the 1.0 default dynamicSetup uses elsewhere, so the pre-calibration
@@ -987,6 +994,7 @@ func TestKiroDynamicRealProductionTraffic(t *testing.T) {
 		trueRatio := map[string][]float64{"A": kiroRealTrafficTrueRatio(kiroRealTrafficSessionA), "B": kiroRealTrafficTrueRatio(kiroRealTrafficSessionB)}
 		positive := map[string][]bool{"A": make([]bool, len(data["A"])), "B": make([]bool, len(data["B"]))}
 		reportedSum := map[string]float64{}
+		reported := map[string][]int{"A": make([]int, len(data["A"])), "B": make([]int, len(data["B"]))}
 		trueEquivSum := map[string]float64{}
 		maxLen := len(kiroRealTrafficSessionA)
 		if len(kiroRealTrafficSessionB) > maxLen {
@@ -1012,19 +1020,19 @@ func TestKiroDynamicRealProductionTraffic(t *testing.T) {
 				if i == 20 {
 					aborted := prepareKiroDynamicCache(a, g, req, row.Input)
 					require.NotNil(t, aborted, "%s: aborted-attempt prepare at call %d", name, i)
-					pairsBefore := len(aborted.scope.pairs)
+					pairsBefore := len(dynamicPairs(aborted))
 					aborted.complete(kiropkg.Usage{}, false)
-					require.Len(t, aborted.scope.pairs, pairsBefore, "%s: aborted attempt at call %d must not add a pair", name, i)
+					require.Len(t, dynamicPairs(aborted), pairsBefore, "%s: aborted attempt at call %d must not add a pair", name, i)
 				}
 				p := prepareKiroDynamicCache(a, g, req, row.Input)
 				require.NotNil(t, p, "%s: call %d", name, i)
 				matched := p.matched
-				// p.scope.pairs reflects the state prepare() saw: prepare()
+				// dynamicPairs(p) reflects the state prepare() saw: prepare()
 				// itself never mutates pairs, only this call's own complete()
 				// (below) can, so reading it here is an accurate snapshot of
 				// which branch (dynamic vs. static fallback) governed this
 				// call's estimate.
-				dynamicActive := len(p.scope.pairs) >= 2
+				dynamicActive := len(dynamicPairs(p)) >= 2
 				if i == 0 {
 					// First-call cold baseline: even though the shared scope
 					// may already be warm from the other session's calls
@@ -1062,7 +1070,7 @@ func TestKiroDynamicRealProductionTraffic(t *testing.T) {
 					// precedence over the fallback. It may legitimately
 					// report nil (a genuinely calibrated "no reuse" verdict,
 					// as established by TestKiroDynamicCalibrationAndFrozenUsage)
-					// or a positive estimate bounded by the .9 lower-envelope
+					// or a positive estimate bounded by the .9 credit-savings
 					// savings cap, converted through Claude's calibrated d
 					// (kiroInferredReuse(.9, d) saturates to 1 for Claude, so
 					// the bound in reuse terms is the full matched count).
@@ -1070,11 +1078,14 @@ func TestKiroDynamicRealProductionTraffic(t *testing.T) {
 						require.LessOrEqual(t, result.CacheReadInputTokens, matched, "%s: call %d", name, i)
 						ratio := float64(result.CacheReadInputTokens) / float64(matched)
 						maxReuse := kiroInferredReuse(.9, kiroClaudeCachedMarginalCreditRatio)
-						require.LessOrEqual(t, ratio, maxReuse+1e-9, "%s: call %d exceeds the dynamic lower-envelope cap", name, i)
+						require.LessOrEqual(t, ratio, maxReuse+1e-9, "%s: call %d exceeds the dynamic credit-savings cap", name, i)
 						positive[name][i] = true
 						reportedSum[name] += float64(result.CacheReadInputTokens)
 						trueEquivSum[name] += float64(matched) * kiroInferredReuse(trueRatio[name][i], kiroClaudeCachedMarginalCreditRatio)
 					}
+				}
+				if result := p.result(); result != nil {
+					reported[name][i] = result.CacheReadInputTokens
 				}
 				p.complete(dynamicUsageWithInput(t, row.Credits, row.Input, row.Output), true)
 			}
@@ -1104,19 +1115,31 @@ func TestKiroDynamicRealProductionTraffic(t *testing.T) {
 			for i := tailStart; i < len(positive[name]); i++ {
 				require.True(t, positive[name][i], "%s: call %d in the final stretch reported no cache reuse", name, i)
 			}
-			// Conservative vs. the real observed native-credit reduction: the
-			// total cache-equivalent tokens this estimator ever claimed for
-			// the session must stay meaningfully below what the raw
-			// native-credit series actually implies once put through the
-			// same calibrated conversion the estimator itself uses (each
-			// call's own instantaneous savings -> reuse, independently
-			// computed in kiroRealTrafficTrueRatio and never seen by the
-			// estimator, which only ever sees a windowed lower envelope of
-			// savings across several calls -- always <= any single call's
-			// own savings, so it stays conservative in the converted space
-			// too).
-			require.Greater(t, reportedSum[name], 0.0, "%s: estimator should have reported nonzero cache reuse", name)
-			require.Less(t, reportedSum[name]/trueEquivSum[name], .95, "%s: aggregate estimate is not conservative relative to observed native-credit reduction", name)
+			// Replaying each session alone must produce the exact same estimates
+			// as interleaving them behind one account. An arbitrary discount
+			// against instantaneous credit density would reward the contamination
+			// this regression fixes; structural caps are asserted on every call.
+			isolatedAccount := *a
+			isolatedAccount.ID += int64(name[0])
+			isolated := kiroRealTrafficRequest(t, "prod-session-"+strings.ToLower(name))
+			isolatedSum := 0.0
+			for i, row := range data[name] {
+				if i > 0 {
+					isolated = kiroRealTrafficGrow(t, isolated, name, i)
+				}
+				p := prepareKiroDynamicCache(&isolatedAccount, g, isolated, row.Input)
+				require.NotNil(t, p)
+				read := 0
+				if result := p.result(); result != nil {
+					read = result.CacheReadInputTokens
+				}
+				require.Equal(t, reported[name][i], read, "%s: call %d differs when replayed alone", name, i)
+				isolatedSum += float64(read)
+				p.complete(dynamicUsageWithInput(t, row.Credits, row.Input, row.Output), true)
+			}
+			require.Greater(t, reportedSum[name], 0.0, "%s: estimator should report cache reuse", name)
+			require.Equal(t, isolatedSum, reportedSum[name], "%s: other sessions must not affect calibration", name)
+			t.Logf("%s: reported/instantaneous-credit-reference = %.4f", name, reportedSum[name]/trueEquivSum[name])
 		}
 	})
 
@@ -1214,8 +1237,8 @@ func TestKiroDynamicUnstablePrefixMidSessionRecalibratesUnderVariableOutput(t *t
 // TestKiroDynamicVariableOutputOutlierResistance extends the fixed-output
 // outlier-recovery coverage in TestKiroDynamicCalibrationAndFrozenUsage to
 // the variable-output path this fix introduces: a single anomalously cheap
-// warm observation must not let the estimator claim more than the
-// lower-envelope policy already allows, and the anomaly must age out of the
+// warm observation is retained but cannot suppress future reuse on its own,
+// and the anomaly must age out of the
 // 8-pair window as later, unremarkable observations push it out.
 func TestKiroDynamicVariableOutputOutlierResistance(t *testing.T) {
 	a, g, _ := dynamicSetup(t)
@@ -1231,20 +1254,20 @@ func TestKiroDynamicVariableOutputOutlierResistance(t *testing.T) {
 	// A normal, varying-output run of warm calls settles at the .9 cap.
 	warm(2, 250) // density 2/250=.008 -> ratio .984 capped to .9
 	warm(3, 900) // density 3/900=.00333 -> ratio .99333 capped to .9
-	require.InDelta(t, .9, p.scope.pairs[len(p.scope.pairs)-1].creditSavings, 1e-9)
+	require.InDelta(t, .9, dynamicPairs(p)[len(dynamicPairs(p))-1].creditSavings, 1e-9)
 	// Outlier: a warm call whose density (3.5/10=.35) is much closer to cold
-	// (.5) than the others -- e.g. a partial cache miss upstream -- drags the
-	// lower envelope down hard and immediately, with no smoothing.
+	// (.5) than the others -- e.g. a partial cache miss upstream -- must not
+	// turn one request's density into a persistent low-reuse verdict.
 	outlierPlan := warm(3.5, 10) // savings (.5-.35)/.5 = .3
-	require.Len(t, outlierPlan.scope.pairs, 3)
-	outlierSavings := outlierPlan.scope.pairs[2].creditSavings
+	require.Len(t, dynamicPairs(outlierPlan), 3)
+	outlierSavings := dynamicPairs(outlierPlan)[2].creditSavings
 	require.InDelta(t, .3, outlierSavings, 1e-9)
 	require.Less(t, outlierSavings, .5)
 	outlierReuse := kiroInferredReuse(outlierSavings, kiroClaudeCachedMarginalCreditRatio)
 	next := dynamicPrepare(t, a, g, r)
 	require.NotNil(t, next.result())
-	require.InDelta(t, outlierReuse, float64(next.result().CacheReadInputTokens)/float64(next.matched), 1e-3,
-		"the lower envelope must apply the outlier's converted reuse immediately, never a smoothed/averaged ratio")
+	require.Equal(t, next.matched, next.result().CacheReadInputTokens,
+		"one low outlier must not suppress the next request")
 	next.complete(kiropkg.Usage{}, false)
 	// Eight more unremarkable warm calls (varying output throughout) are
 	// needed to push the outlier (the 3rd of what becomes 11 pairs ever
@@ -1252,8 +1275,8 @@ func TestKiroDynamicVariableOutputOutlierResistance(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		warm(2, 300+i*37)
 	}
-	require.Len(t, p.scope.pairs, 8)
-	for _, pair := range p.scope.pairs {
+	require.Len(t, dynamicPairs(p), 8)
+	for _, pair := range dynamicPairs(p) {
 		require.NotEqual(t, outlierSavings, pair.creditSavings, "outlier must have aged out of the fixed-size window")
 	}
 	recovered := dynamicPrepare(t, a, g, r)
@@ -1283,14 +1306,14 @@ func TestKiroDynamicStaticFallbackBeforeCalibration(t *testing.T) {
 	p := dynamicPrepare(t, a, g, r)
 	require.Zero(t, p.matched)
 	require.Nil(t, p.result())
-	require.Empty(t, p.scope.pairs)
+	require.Empty(t, dynamicPairs(p))
 	p.complete(dynamicUsage(t, 10, 20), true) // records the cold sample only
 
 	// Call 2: the exact same content is now a proven prefix match
 	// (matched == the full profile), but zero dynamic pairs exist yet.
 	p = dynamicPrepare(t, a, g, r)
 	require.Equal(t, 10000, p.matched)
-	require.Empty(t, p.scope.pairs, "fewer than two pairs must still be true here")
+	require.Empty(t, dynamicPairs(p), "fewer than two pairs must still be true here")
 	result := p.result()
 	require.NotNil(t, result, "matched>0 with zero pairs must still report the static fallback, not nothing")
 	require.Equal(t, scaleKiroCacheTokens(p.matched, staticRatio), result.CacheReadInputTokens)
@@ -1303,7 +1326,7 @@ func TestKiroDynamicStaticFallbackBeforeCalibration(t *testing.T) {
 	// -- the fallback must still govern, using the identical static ratio.
 	p = dynamicPrepare(t, a, g, r)
 	require.Equal(t, 10000, p.matched)
-	require.Len(t, p.scope.pairs, 1)
+	require.Len(t, dynamicPairs(p), 1)
 	result = p.result()
 	require.NotNil(t, result)
 	require.Equal(t, 4000, result.CacheReadInputTokens)
@@ -1328,19 +1351,19 @@ func TestKiroDynamicStaticFallbackTransitionsToDynamic(t *testing.T) {
 	// Fallback governs for the next two calls (0 then 1 pairs).
 	for i := 0; i < 2; i++ {
 		p = dynamicPrepare(t, a, g, r)
-		require.Less(t, len(p.scope.pairs), 2)
+		require.Less(t, len(dynamicPairs(p)), 2)
 		result := p.result()
 		require.NotNil(t, result, "call %d", i)
 		require.Equal(t, 3000, result.CacheReadInputTokens, "call %d: static fallback = round(10000*0.3)", i)
 		p.complete(dynamicUsage(t, 2, 20), true) // density .1 -> pair ratio .8 each time
 	}
-	require.Len(t, p.scope.pairs, 2)
+	require.Len(t, dynamicPairs(p), 2)
 
 	// The instant two pairs exist, dynamic calibration (credit savings .8,
 	// which saturates to full inferred reuse under Claude's calibrated
 	// d=.525, far above the static .3) takes over unconditionally.
 	p = dynamicPrepare(t, a, g, r)
-	require.Len(t, p.scope.pairs, 2)
+	require.Len(t, dynamicPairs(p), 2)
 	result := p.result()
 	require.NotNil(t, result)
 	require.Equal(t, 10000, result.CacheReadInputTokens, "dynamic estimate (savings .8, saturating) must govern, not the static .3 fallback")

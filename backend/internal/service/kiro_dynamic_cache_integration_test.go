@@ -223,11 +223,26 @@ func TestKiroDynamicProtocolSchemasLocalIntegration(t *testing.T) {
 						require.InDelta(t, .5, float64(result.Usage.CacheReadInputTokens)/float64(total), .0001)
 					default: // i == 3
 						// Two dynamic pairs now exist; dynamic calibration
-						// (ratio .8, from credits 10,2,2) takes over and
+						// (.8 savings / (1-.525), capped at 1) takes over and
 						// governs regardless of the static 0.5 ratio.
 						require.Greater(t, result.Usage.CacheReadInputTokens, 0)
-						total := result.Usage.InputTokens + result.Usage.CacheReadInputTokens
-						require.InDelta(t, .8, float64(result.Usage.CacheReadInputTokens)/float64(total), .0001)
+						if protocol == "anthropic" && !stream {
+							// Check the public usage here: kiroUsageToClaude's existing
+							// internal fallback backfills zero input at full reuse.
+							// This calibration change must not alter billing conversion.
+							var response struct {
+								Usage struct {
+									Input int `json:"input_tokens"`
+									Read  int `json:"cache_read_input_tokens"`
+								} `json:"usage"`
+							}
+							require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+							require.Zero(t, response.Usage.Input)
+							require.Equal(t, result.Usage.CacheReadInputTokens, response.Usage.Read)
+						} else {
+							total := result.Usage.InputTokens + result.Usage.CacheReadInputTokens
+							require.Equal(t, total, result.Usage.CacheReadInputTokens)
+						}
 					}
 					require.InDelta(t, []float64{10, 2, 2, 2}[i], result.Usage.KiroCredits, 1e-9)
 					for _, forbidden := range []string{"_sub2api", "kiro_native_credits", "reuse_index"} {
@@ -256,7 +271,10 @@ func TestKiroDynamicProtocolSchemasLocalIntegration(t *testing.T) {
 				globalKiroDynamicTracker.mu.Lock()
 				for _, scope := range globalKiroDynamicTracker.scopes {
 					require.Zero(t, scope.active)
-					require.Len(t, scope.pairs, 3)
+					require.Len(t, scope.samples, 1)
+					for _, sample := range scope.samples {
+						require.Len(t, sample.pairs, 3)
+					}
 				}
 				globalKiroDynamicTracker.mu.Unlock()
 			})

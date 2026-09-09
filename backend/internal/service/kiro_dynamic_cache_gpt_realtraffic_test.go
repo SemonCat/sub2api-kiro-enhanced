@@ -83,13 +83,13 @@ func TestKiroDynamicGPTRealTrafficCalibration(t *testing.T) {
 				p = prepareKiroDynamicCache(a, g, r, pair.Tokens)
 				require.NotNil(t, p)
 				require.Greater(t, p.matched, 0)
-				require.Less(t, len(p.scope.pairs), 2, "call %d", i)
+				require.Less(t, len(dynamicPairs(p)), 2, "call %d", i)
 				result := p.result()
 				require.NotNil(t, result, "call %d", i)
 				require.Equal(t, scaleKiroCacheTokens(p.matched, staticRatio), result.CacheReadInputTokens, "call %d", i)
 				p.complete(dynamicUsageWithInput(t, pair.WarmAvg, pair.Tokens, output), true)
 			}
-			require.Len(t, p.scope.pairs, 2, "two valid pairs must exist before dynamic calibration governs")
+			require.Len(t, dynamicPairs(p), 2, "two valid pairs must exist before dynamic calibration governs")
 
 			expectedSavings := (pair.Cold - pair.WarmAvg) / pair.Cold
 			require.Greater(t, expectedSavings, 0.40, "sanity: fixture should sit in the ~45-53%% raw-savings range the pre-fix estimator was pinned to")
@@ -102,7 +102,7 @@ func TestKiroDynamicGPTRealTrafficCalibration(t *testing.T) {
 			// genuinely near-fully reused.
 			p = prepareKiroDynamicCache(a, g, r, pair.Tokens)
 			require.NotNil(t, p)
-			require.Len(t, p.scope.pairs, 2)
+			require.Len(t, dynamicPairs(p), 2)
 			result := p.result()
 			require.NotNil(t, result)
 			require.InDelta(t, expectedReuse, float64(result.CacheReadInputTokens)/float64(p.matched), 1e-3)
@@ -137,8 +137,8 @@ func TestKiroDynamicGPTRealTrafficZeroSavingsIsLegitimateZero(t *testing.T) {
 		p = dynamicPrepare(t, a, g, r)
 		p.complete(dynamicUsage(t, 10, 20), true) // identical density -> zero savings
 	}
-	require.Len(t, p.scope.pairs, 2)
-	require.Zero(t, p.scope.pairs[0].creditSavings)
+	require.Len(t, dynamicPairs(p), 2)
+	require.Zero(t, dynamicPairs(p)[0].creditSavings)
 	p = dynamicPrepare(t, a, g, r)
 	require.Nil(t, p.result(), "zero credit savings must convert to zero reuse, not the nonzero static fallback")
 	p.complete(kiropkg.Usage{}, false)

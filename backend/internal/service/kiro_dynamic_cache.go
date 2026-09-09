@@ -20,6 +20,7 @@ const (
 	kiroDynamicMaxAccountScopes = 32
 	kiroDynamicMaxPrefixes      = 256
 	kiroDynamicMaxSamples       = 64
+	kiroDynamicMaxPairs         = 8
 	kiroDynamicCalibrationTTL   = 30 * time.Minute
 
 	// kiroGPTCachedMarginalCreditRatio and kiroClaudeCachedMarginalCreditRatio
@@ -112,6 +113,9 @@ type kiroDynamicSample struct {
 	// from ever overclaiming savings.
 	coldDensity float64
 	expires     time.Time
+	// Each cold (shape, prefix) baseline owns its bounded warm observations.
+	// Prefix warmth may be shared, but credit evidence must not cross lineages.
+	pairs []kiroDynamicPair
 }
 type kiroDynamicPair struct {
 	// creditSavings is the observed native-credit savings fraction s =
@@ -131,7 +135,6 @@ type kiroDynamicScope struct {
 	expires  time.Time
 	prefixes map[[32]byte]time.Time
 	samples  map[kiroDynamicSampleKey]kiroDynamicSample
-	pairs    []kiroDynamicPair
 	active   int
 	epoch    uint64
 }
@@ -344,17 +347,21 @@ func (t *kiroDynamicTracker) prepare(account int64, key, shape [32]byte, profile
 	// prefixes either, since complete() only records them on success. None of
 	// those cases fall back to the static estimator below.
 	if matched > 0 {
-		if len(scope.pairs) >= 2 {
-			// Lower envelope of the last eight matched pairs' credit savings.
-			// Downward evidence applies immediately; old outliers age out so
-			// calibration can recover. This is the authoritative dynamic
-			// estimate: once it exists it takes precedence over the static
-			// fallback below even when it evaluates to a legitimate zero (a
-			// real, calibrated "no reuse" verdict is not the same as "no
-			// dynamic ratio available").
-			savings := .9
-			for _, pair := range scope.pairs {
-				savings = math.Min(savings, pair.creditSavings)
+		pairs := scope.calibrationPairs(profile, shape, matched)
+		if len(pairs) >= 2 {
+			// Use the second-smallest savings in this lineage's last eight
+			// observations. One low/zero outlier cannot govern later calls;
+			// two corroborating low observations still lower the estimate,
+			// including to zero. This deliberately tolerates one downside
+			// outlier rather than treating request-level density as proof of
+			// a persistent cache miss.
+			lowest, savings := .9, .9
+			for _, pair := range pairs {
+				if pair.creditSavings < lowest {
+					savings, lowest = lowest, pair.creditSavings
+				} else if pair.creditSavings < savings {
+					savings = pair.creditSavings
+				}
 			}
 			// creditSavings is the native-credit savings fraction s, not the
 			// structural token-reuse fraction r. For a calibrated family,
@@ -375,8 +382,8 @@ func (t *kiroDynamicTracker) prepare(account int64, key, shape [32]byte, profile
 			}
 		} else {
 			// Static pre-estimator fallback: native-credit calibration has
-			// not yet produced two valid pairs for this scope, but canonical
-			// prefix matching has already proven a real repeated prefix.
+			// not yet produced two valid pairs for this shape/prefix lineage,
+			// but canonical prefix matching has already proven a real repeated prefix.
 			// Reporting a deliberately less-precise static estimate here --
 			// using the group's existing EffectiveKiroCacheReadEmulationRatio
 			// and the pre-regression static estimator's own bounds/rounding
@@ -384,7 +391,7 @@ func (t *kiroDynamicTracker) prepare(account int64, key, shape [32]byte, profile
 			// reporting zero for genuinely warmed traffic. The moment dynamic
 			// calibration produces >=2 pairs, the branch above takes over
 			// unconditionally (including when it computes a valid ratio of
-			// 0) and this fallback no longer runs for this scope.
+			// 0) and this fallback no longer runs for this lineage.
 			read := scaleKiroCacheTokens(matched, staticReadRatio)
 			read = min(max(read, 0), profile.totalInputTokens)
 			if read > 0 {
@@ -393,6 +400,24 @@ func (t *kiroDynamicTracker) prepare(account int64, key, shape [32]byte, profile
 		}
 	}
 	return plan
+}
+
+// calibrationPairs selects the deepest cold baseline on the proven warm
+// ladder with the same inference shape. Never borrow credit observations from
+// unrelated content or shapes just because they share account/model warmth.
+func (s *kiroDynamicScope) calibrationPairs(profile *kiroCacheProfile, shape [32]byte, matched int) []kiroDynamicPair {
+	breakpoints := profile.cacheableBreakpoints()
+	for i := len(breakpoints) - 1; i >= 0; i-- {
+		bp := breakpoints[i]
+		if profile.cacheTokensForBreakpoint(bp.cumulativeTokens) > matched {
+			continue
+		}
+		key := kiroDynamicSampleKey{shape: shape, prefix: profile.blocks[bp.blockIndex].prefixFingerprint}
+		if sample, ok := s.samples[key]; ok {
+			return sample.pairs
+		}
+	}
+	return nil
 }
 
 // complete is idempotent. The caller invokes it only after native EOF, parser
@@ -436,11 +461,11 @@ func (p *kiroCacheEmulationPlan) complete(usage kiropkg.Usage, success bool) {
 				density := usage.KiroCredits / float64(total)
 				k := kiroDynamicSampleKey{shape: p.shape, prefix: p.profile.blocks[len(p.profile.blocks)-1].prefixFingerprint}
 				sample, exists := s.samples[k]
-				if exists && !sample.expires.After(now) {
-					delete(s.samples, k)
-					exists = false
-				}
 				if p.matched == 0 {
+					if exists && !sample.expires.After(now) {
+						exists = false
+						delete(s.samples, k)
+					}
 					if !exists || density < sample.coldDensity {
 						sample = kiroDynamicSample{coldDensity: density, expires: now.Add(kiroDynamicCalibrationTTL)}
 					}
@@ -467,10 +492,11 @@ func (p *kiroCacheEmulationPlan) complete(usage kiropkg.Usage, success bool) {
 							continue
 						}
 						savings := math.Min(.9, math.Max(0, (cold.coldDensity-density)/cold.coldDensity))
-						s.pairs = append(s.pairs, kiroDynamicPair{creditSavings: savings, expires: now.Add(kiroDynamicCalibrationTTL)})
-						if len(s.pairs) > 8 {
-							s.pairs = s.pairs[len(s.pairs)-8:]
+						cold.pairs = append(cold.pairs, kiroDynamicPair{creditSavings: savings, expires: now.Add(kiroDynamicCalibrationTTL)})
+						if len(cold.pairs) > kiroDynamicMaxPairs {
+							cold.pairs = cold.pairs[len(cold.pairs)-kiroDynamicMaxPairs:]
 						}
+						s.samples[k] = cold
 						break
 					}
 				}
@@ -502,16 +528,20 @@ func (t *kiroDynamicTracker) prune(now time.Time) {
 			}
 		}
 		for k, sample := range s.samples {
-			if !sample.expires.After(now) {
+			pairs := sample.pairs[:0]
+			for _, pair := range sample.pairs {
+				if pair.expires.After(now) {
+					pairs = append(pairs, pair)
+				}
+			}
+			sample.pairs = pairs
+			// Pair evidence keeps its own TTL after the cold baseline expires,
+			// but an expired baseline cannot form new pairs in complete().
+			if !sample.expires.After(now) && len(pairs) == 0 {
 				delete(s.samples, k)
+			} else {
+				s.samples[k] = sample
 			}
 		}
-		pairs := s.pairs[:0]
-		for _, pair := range s.pairs {
-			if pair.expires.After(now) {
-				pairs = append(pairs, pair)
-			}
-		}
-		s.pairs = pairs
 	}
 }

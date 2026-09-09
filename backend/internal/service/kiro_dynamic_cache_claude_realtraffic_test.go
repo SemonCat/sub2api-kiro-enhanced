@@ -1,6 +1,7 @@
 package service
 
 import (
+	"sort"
 	"strconv"
 	"testing"
 
@@ -104,7 +105,7 @@ func TestKiroDynamicClaudeRealTrafficCalibration(t *testing.T) {
 			p.complete(dynamicUsageWithInput(t, pair.Cold, pair.Tokens, output), true)
 
 			warms := []float64{pair.Warm1, pair.Warm2, pair.Warm3}
-			var minSavings float64
+			var observedSavings []float64
 			for i, warmCredits := range warms {
 				p = prepareKiroDynamicCache(a, g, r, pair.Tokens)
 				require.NotNil(t, p)
@@ -113,34 +114,31 @@ func TestKiroDynamicClaudeRealTrafficCalibration(t *testing.T) {
 					// First two warm turns: canonical prefix is proven but
 					// fewer than two dynamic pairs exist yet, so the static
 					// pre-calibration fallback must govern exactly.
-					require.Less(t, len(p.scope.pairs), 2, "warm turn %d", i)
+					require.Less(t, len(dynamicPairs(p)), 2, "warm turn %d", i)
 					result := p.result()
 					require.NotNil(t, result, "warm turn %d", i)
 					require.Equal(t, scaleKiroCacheTokens(p.matched, staticRatio), result.CacheReadInputTokens, "warm turn %d", i)
 				} else {
 					// Third warm turn onward: two dynamic pairs (from warm
 					// turns 0 and 1) already exist, so calibrated conversion
-					// governs -- the lower envelope of their credit savings,
+					// governs -- the corroborated credit savings,
 					// converted through Claude's calibrated d.
-					require.GreaterOrEqual(t, len(p.scope.pairs), 2, "warm turn %d", i)
+					require.GreaterOrEqual(t, len(dynamicPairs(p)), 2, "warm turn %d", i)
 				}
 				p.complete(dynamicUsageWithInput(t, warmCredits, pair.Tokens, output), true)
 				savings := (pair.Cold - warmCredits) / pair.Cold
-				if i == 0 {
-					minSavings = savings
-				} else {
-					minSavings = min(minSavings, savings)
-				}
+				observedSavings = append(observedSavings, savings)
 			}
-			require.Len(t, p.scope.pairs, 3, "all three warm turns must have formed a pair")
+			require.Len(t, dynamicPairs(p), 3, "all three warm turns must have formed a pair")
 
 			// One more call: dynamic calibration now governs using the
-			// envelope over all three real warm observations.
+			// second-smallest of the three real warm observations.
 			p = prepareKiroDynamicCache(a, g, r, pair.Tokens)
 			require.NotNil(t, p)
 			result := p.result()
 			require.NotNil(t, result)
-			expectedReuse := kiroInferredReuse(minSavings, kiroClaudeCachedMarginalCreditRatio)
+			sort.Float64s(observedSavings)
+			expectedReuse := kiroInferredReuse(observedSavings[1], kiroClaudeCachedMarginalCreditRatio)
 			observedReuse := float64(result.CacheReadInputTokens) / float64(p.matched)
 			require.InDelta(t, expectedReuse, observedReuse, 1e-3)
 
@@ -185,13 +183,13 @@ func TestKiroDynamicClaudeSonnetHoldoutValidatesSameFamilyConstant(t *testing.T)
 			for i := 0; i < 2; i++ {
 				p = prepareKiroDynamicCache(a, g, r, pair.Tokens)
 				require.NotNil(t, p)
-				require.Less(t, len(p.scope.pairs), 2, "warm turn %d", i)
+				require.Less(t, len(dynamicPairs(p)), 2, "warm turn %d", i)
 				result := p.result()
 				require.NotNil(t, result, "warm turn %d", i)
 				require.Equal(t, scaleKiroCacheTokens(p.matched, staticRatio), result.CacheReadInputTokens, "warm turn %d", i)
 				p.complete(dynamicUsageWithInput(t, pair.WarmAvg, pair.Tokens, output), true)
 			}
-			require.Len(t, p.scope.pairs, 2)
+			require.Len(t, dynamicPairs(p), 2)
 
 			expectedSavings := (pair.Cold - pair.WarmAvg) / pair.Cold
 			p = prepareKiroDynamicCache(a, g, r, pair.Tokens)
@@ -228,8 +226,8 @@ func TestKiroDynamicClaudeRealTrafficZeroSavingsIsLegitimateZero(t *testing.T) {
 		p = dynamicPrepare(t, a, g, r)
 		p.complete(dynamicUsage(t, 10, 20), true) // identical density -> zero savings
 	}
-	require.Len(t, p.scope.pairs, 2)
-	require.Zero(t, p.scope.pairs[0].creditSavings)
+	require.Len(t, dynamicPairs(p), 2)
+	require.Zero(t, dynamicPairs(p)[0].creditSavings)
 	p = dynamicPrepare(t, a, g, r)
 	require.Nil(t, p.result(), "zero credit savings must convert to zero reuse, not the nonzero static fallback")
 	p.complete(kiropkg.Usage{}, false)
